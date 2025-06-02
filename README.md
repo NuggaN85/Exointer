@@ -1,3 +1,5 @@
+**`Mise à jour : version 1.1.4`**
+
 # Bot Discord Inter-Serveur
 
 Un bot Discord qui permet de relayer des messages entre différents serveurs via des fréquences uniques.
