@@ -1,6 +1,6 @@
 **`Mise à jour : version 1.1.4`**
 
-# Exointer Bot Discord
+# Exointer Discord Bot
 
 Un bot Discord qui permet de relayer des messages entre différents serveurs via des fréquences uniques.
 
