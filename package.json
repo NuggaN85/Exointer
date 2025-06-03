@@ -1,0 +1,28 @@
+{
+  "name": "EXOINTER",
+  "version": "1.0.0",
+  "description": "Je suis un bot conçu pour discuté grâce à l'interconnexion entre serveurs !",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "start": "node src/bot.js",
+    "dev": "nodemon src/bot.js",
+    "update-deps": "npx npm-check-updates -u && npm install",
+    "audit": "npm audit",
+    "clean": "rm -rf node_modules && npm install",
+    "lint": "eslint .",
+    "format": "prettier --write ."
+  },
+  "dependencies": {
+    "discord.js": "^14.19.3",
+    "dotenv": "^16.5.0"
+  },
+  "devDependencies": {
+    "nodemon": "^3.1.10",
+    "npm-check-updates": "^18.0.1",
+    "eslint": "^9.27.0",
+    "prettier": "^3.5.3"
+  },
+  "author": "EXOBOT",
+  "license": "MIT"
+}
