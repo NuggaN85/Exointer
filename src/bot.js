@@ -39,13 +39,11 @@ const LANGUAGES = {
 };
 
 function encodeMentions(content) {
+  if (!content) return content;
+  
   return content
-    // Désactive `@everyone` et `@here` avec insertion d’un caractère invisible
-    .replace(/`@everyone`/g, '@\u200Beveryone')
-    .replace(/`@here`/g, '@\u200Bhere')
-    // Désactive les mentions d’utilisateurs ou rôles sous forme `<@123>` ou `<@&456>`
-    .replace(/<@!?(\d+)>/g, '<@\u200B$1>')
-    .replace(/<@&(\d+)>/g, '<@&\u200B$1>');
+    .replace(/@(everyone|here)/g, '@\u200b$1')
+    .replace(/<@&?(\d{17,20})>/g, '<@\u200b$1>');
 }
 
 const webhookCache = new Map();
