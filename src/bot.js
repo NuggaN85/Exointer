@@ -1,8 +1,7 @@
 'use strict';
 
 import { Client, GatewayIntentBits, SlashCommandBuilder, REST, Routes, EmbedBuilder, ActivityType, ActionRowBuilder, ButtonBuilder, ButtonStyle, PermissionsBitField, WebhookClient } from 'discord.js';
-import fs from 'fs/promises';
-import fsSync from 'fs';
+import Database from 'better-sqlite3';
 import * as dotenv from 'dotenv';
 import { v4 as uuidv4 } from 'uuid';
 
@@ -22,10 +21,10 @@ const client = new Client({
   ]
 });
 
+const db = new Database('./data.db', { verbose: console.log });
 const connectedChannels = new Map();
 const relayMap = new Map();
 const bannedUsers = new Set();
-const DATA_FILE = './data.json';
 const MAX_FILE_SIZE = 8 * 1024 * 1024; // 8 Mo
 const RELAY_MAP_TTL = 24 * 60 * 60 * 1000; // 24h
 const LANGUAGES = {
@@ -38,9 +37,29 @@ const LANGUAGES = {
   }
 };
 
+// Initialize database
+db.exec(`
+  CREATE TABLE IF NOT EXISTS channels (
+    frequency TEXT,
+    channel_id TEXT,
+    is_private BOOLEAN,
+    PRIMARY KEY (frequency, channel_id)
+  );
+  CREATE TABLE IF NOT EXISTS logs (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    timestamp TEXT,
+    action TEXT,
+    details TEXT
+  );
+  CREATE TABLE IF NOT EXISTS banned_users (
+    frequency TEXT,
+    user_id TEXT,
+    PRIMARY KEY (frequency, user_id)
+  );
+`);
+
 function encodeMentions(content) {
   if (!content) return content;
-  
   return content
     .replace(/@(everyone|here)/g, '@\u200b$1')
     .replace(/<@&?(\d{17,20})>/g, '<@\u200b$1>');
@@ -50,46 +69,45 @@ const webhookCache = new Map();
 
 async function loadData() {
   try {
-    const data = await fs.readFile(DATA_FILE, 'utf8');
-    if (!data.trim()) {
-      await saveData();
-      return;
-    }
-    const parsed = JSON.parse(data);
     connectedChannels.clear();
-    for (const [freq, { channels }] of Object.entries(parsed.channels || {})) {
-      connectedChannels.set(freq, new Set(channels));
+    bannedUsers.clear();
+    const channels = db.prepare('SELECT frequency, channel_id FROM channels').all();
+    for (const { frequency, channel_id } of channels) {
+      if (!connectedChannels.has(frequency)) connectedChannels.set(frequency, new Set());
+      connectedChannels.get(frequency).add(channel_id);
     }
-    console.log('📂 Données chargées depuis data.json');
+    const bans = db.prepare('SELECT frequency, user_id FROM banned_users').all();
+    for (const { frequency, user_id } of bans) {
+      bannedUsers.add(`${frequency}:${user_id}`);
+    }
+    console.log('📂 Données chargées depuis SQLite');
   } catch (error) {
-    if (error.code === 'ENOENT' || error.message.includes('Unexpected end of JSON input')) {
-      await saveData();
-    } else {
-      console.error('❌ Erreur chargement data.json:', error.message);
-    }
+    console.error('❌ Erreur chargement SQLite:', error.message);
   }
 }
 
 async function saveData() {
   try {
-    const data = {
-      channels: Object.fromEntries(
-        [...connectedChannels].map(([freq, channels]) => [freq, { channels: Array.from(channels), isPrivate: false }])
-      ),
-      logs: (await fs.readFile(DATA_FILE, 'utf8').then(d => JSON.parse(d).logs || []).catch(() => []))
-    };
-    await fs.writeFile(DATA_FILE, JSON.stringify(data, null, 2));
-    console.log('💾 Données sauvegardées dans data.json');
+    const transaction = db.transaction(() => {
+      db.prepare('DELETE FROM channels').run();
+      const insertChannel = db.prepare('INSERT OR REPLACE INTO channels (frequency, channel_id, is_private) VALUES (?, ?, ?)');
+      for (const [frequency, channels] of connectedChannels) {
+        for (const channelId of channels) {
+          insertChannel.run(frequency, channelId, 0); // Use 0 for false
+        }
+      }
+    });
+    transaction();
+    console.log('💾 Données sauvegardées dans SQLite');
   } catch (error) {
-    console.error('❌ Erreur sauvegarde data.json:', error);
+    console.error('❌ Erreur sauvegarde SQLite:', error);
   }
 }
 
 async function logAction(action, details) {
   try {
-    const data = await fs.readFile(DATA_FILE, 'utf8').then(d => JSON.parse(d)).catch(() => ({ logs: [] }));
-    data.logs.push({ timestamp: new Date().toISOString(), action, details });
-    await fs.writeFile(DATA_FILE, JSON.stringify(data, null, 2));
+    const insertLog = db.prepare('INSERT INTO logs (timestamp, action, details) VALUES (?, ?, ?)');
+    insertLog.run(new Date().toISOString(), action, JSON.stringify(details));
   } catch (error) {
     console.error('❌ Erreur sauvegarde log:', error);
   }
@@ -161,15 +179,13 @@ const commands = [
 client.on('guildCreate', () => updateActivity());
 client.on('guildDelete', async guild => {
   updateActivity();
-  for (const [frequency, channels] of connectedChannels) {
-    channels.delete(guild.id);
-    if (channels.size === 0) connectedChannels.delete(frequency);
-  }
-  await saveData();
+  const deleteStmt = db.prepare('DELETE FROM channels WHERE channel_id LIKE ?');
+  deleteStmt.run(`${guild.id}%`);
+  await loadData(); // Reload to sync Map
   await logAction('guildDelete', { guildId: guild.id });
 });
 
-client.on('ready', async () => {
+client.on('clientReady', async () => {
   console.log(`✅ Bot connecté en tant que ${client.user.tag}!`);
   await loadData();
   updateActivity();
@@ -222,6 +238,7 @@ client.on('interactionCreate', async interaction => {
       const frequency = uuidv4().slice(0, 8);
       const key = isPrivate ? uuidv4().slice(0, 12) : null;
       connectedChannels.set(frequency, new Set([interaction.channelId]));
+      db.prepare('INSERT INTO channels (frequency, channel_id, is_private) VALUES (?, ?, ?)').run(frequency, interaction.channelId, isPrivate ? 1 : 0);
       await saveData();
       await interaction.reply({
         content: `📡 Fréquence générée : **${frequency}**${isPrivate ? `\nClé : **${key}**` : ''}`,
@@ -246,6 +263,7 @@ client.on('interactionCreate', async interaction => {
       }
 
       channelSet.add(interaction.channelId);
+      db.prepare('INSERT INTO channels (frequency, channel_id, is_private) VALUES (?, ?, ?)').run(frequency, interaction.channelId, 0);
       await saveData();
       await interaction.reply({ content: `🔗 Salon lié à **${frequency}**.`, ephemeral: true });
 
@@ -278,6 +296,7 @@ client.on('interactionCreate', async interaction => {
         if (channels.has(interaction.channelId)) {
           found = true;
           channels.delete(interaction.channelId);
+          db.prepare('DELETE FROM channels WHERE frequency = ? AND channel_id = ?').run(frequency, interaction.channelId);
           await interaction.reply({ content: `🔌 Délié de **${frequency}**`, ephemeral: true });
 
           const content = LANGUAGES.fr.disconnected
@@ -290,7 +309,10 @@ client.on('interactionCreate', async interaction => {
             if (channel?.isTextBased()) await channel.send({ content });
           }));
 
-          if (channels.size === 0) connectedChannels.delete(frequency);
+          if (channels.size === 0) {
+            connectedChannels.delete(frequency);
+            db.prepare('DELETE FROM channels WHERE frequency = ?').run(frequency);
+          }
           await saveData();
           await logAction('unlink', { frequency, channel: interaction.channelId });
           break;
@@ -310,7 +332,7 @@ client.on('interactionCreate', async interaction => {
           name: channel.guild.name,
           frequency,
           liaisonCount: guildIds.size,
-          isPrivate: false
+          isPrivate: db.prepare('SELECT is_private FROM channels WHERE frequency = ? LIMIT 1').get(frequency)?.is_private || 0
         });
       }
 
@@ -385,6 +407,7 @@ client.on('interactionCreate', async interaction => {
         return;
       }
       bannedUsers.add(`${frequency}:${user.id}`);
+      db.prepare('INSERT OR IGNORE INTO banned_users (frequency, user_id) VALUES (?, ?)').run(frequency, user.id);
       await interaction.reply({ content: LANGUAGES.fr.banned.replace('{frequency}', frequency), ephemeral: true });
       await logAction('ban', { frequency, user: user.id });
     }
@@ -407,9 +430,10 @@ client.on('interactionCreate', async interaction => {
         }
       }));
 
+      const isPrivate = db.prepare('SELECT is_private FROM channels WHERE frequency = ? LIMIT 1').get(frequency)?.is_private || 0;
       const embed = new EmbedBuilder()
         .setTitle(`📡 Infos Fréquence ${frequency}`)
-        .setDescription(`Type: 🌍 Publique`)
+        .setDescription(`Type: ${isPrivate ? '🔒 Privée' : '🌍 Publique'}`)
         .addFields(
           { name: '🏠 Serveurs', value: `${guilds.size} (${[...guilds].join(', ')})`, inline: true },
           { name: '👥 Membres', value: `${memberCount}`, inline: true },
@@ -538,13 +562,8 @@ client.on('messageReactionRemove', async (reaction, user) => {
 
 process.on('SIGINT', () => {
   try {
-    const data = {
-      channels: Object.fromEntries(
-        [...connectedChannels].map(([freq, channels]) => [freq, { channels: Array.from(channels), isPrivate: false }])
-      ),
-      logs: fsSync.readFileSync(DATA_FILE, 'utf8').length ? JSON.parse(fsSync.readFileSync(DATA_FILE, 'utf8')).logs || [] : []
-    };
-    fsSync.writeFileSync(DATA_FILE, JSON.stringify(data, null, 2));
+    saveData();
+    db.close();
     console.log('💾 Données sauvegardées (SIGINT)');
     process.exit(0);
   } catch (error) {
@@ -555,13 +574,8 @@ process.on('SIGINT', () => {
 
 process.on('SIGTERM', () => {
   try {
-    const data = {
-      channels: Object.fromEntries(
-        [...connectedChannels].map(([freq, channels]) => [freq, { channels: Array.from(channels), isPrivate: false }])
-      ),
-      logs: fsSync.readFileSync(DATA_FILE, 'utf8').length ? JSON.parse(fsSync.readFileSync(DATA_FILE, 'utf8')).logs || [] : []
-    };
-    fsSync.writeFileSync(DATA_FILE, JSON.stringify(data, null, 2));
+    saveData();
+    db.close();
     console.log('💾 Données sauvegardées (SIGTERM)');
     process.exit(0);
   } catch (error) {
@@ -573,13 +587,8 @@ process.on('SIGTERM', () => {
 process.on('uncaughtException', err => {
   console.error('❌ Erreur fatale:', err);
   try {
-    const data = {
-      channels: Object.fromEntries(
-        [...connectedChannels].map(([freq, channels]) => [freq, { channels: Array.from(channels), isPrivate: false }])
-      ),
-      logs: fsSync.readFileSync(DATA_FILE, 'utf8').length ? JSON.parse(fsSync.readFileSync(DATA_FILE, 'utf8')).logs || [] : []
-    };
-    fsSync.writeFileSync(DATA_FILE, JSON.stringify(data, null, 2));
+    saveData();
+    db.close();
   } catch (e) {
     console.error('❌ Erreur sauvegarde fatale:', e);
   }
@@ -590,13 +599,8 @@ process.on('uncaughtException', err => {
 process.on('unhandledRejection', err => {
   console.error('❌ Erreur non gérée:', err);
   try {
-    const data = {
-      channels: Object.fromEntries(
-        [...connectedChannels].map(([freq, channels]) => [freq, { channels: Array.from(channels), isPrivate: false }])
-      ),
-      logs: fsSync.readFileSync(DATA_FILE, 'utf8').length ? JSON.parse(fsSync.readFileSync(DATA_FILE, 'utf8')).logs || [] : []
-    };
-    fsSync.writeFileSync(DATA_FILE, JSON.stringify(data, null, 2));
+    saveData();
+    db.close();
   } catch (e) {
     console.error('❌ Erreur sauvegarde rejection:', e);
   }
