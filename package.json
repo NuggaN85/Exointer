@@ -1,26 +1,38 @@
 {
   "name": "EXOINTER",
-  "version": "1.0.4",
+  "version": "1.0.0",
   "description": "Je suis un bot conçu pour discuté grâce à l'interconnexion entre serveurs !",
   "private": true,
   "type": "module",
+  "engines": {
+    "node": "24.x",
+    "npm": ">=11.0.0"
+  },
   "scripts": {
     "start": "node src/bot.js",
     "dev": "nodemon src/bot.js",
-    "update-deps": "npx npm-check-updates -u && npm install",
-    "audit": "npm audit",
-    "clean": "rm -rf node_modules && npm install",
+    "prod": "NODE_ENV=production node src/bot.js",
+    "update": "npm-run-all -s update:deps audit fix",
+    "update:deps": "npx npm-check-updates -u && npm install",
+    "update:interactive": "npx npm-check-updates -i",
+    "audit": "npm audit --audit-level=moderate",
+    "fix": "npm audit fix --force",
+    "clean": "rm -rf node_modules package-lock.json && npm install",
+    "check": "npm outdated",
     "lint": "eslint .",
     "format": "prettier --write ."
   },
   "dependencies": {
-    "discord.js": "^14.19.3",
+    "better-sqlite3": "^12.2.0",
+    "discord.js": "^14.22.0",
     "dotenv": "^16.5.0",
     "uuid": "^10.0.0"
   },
   "devDependencies": {
+    "kleur": "^4.1.5",
     "nodemon": "^3.1.10",
     "npm-check-updates": "^18.0.1",
+    "npm-run-all": "^4.1.5",
     "eslint": "^9.27.0",
     "prettier": "^3.5.3"
   },
