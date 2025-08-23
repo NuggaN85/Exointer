@@ -188,11 +188,11 @@ client.on('guildDelete', async guild => {
   updateActivity();
   const deleteStmt = db.prepare('DELETE FROM channels WHERE channel_id LIKE ?');
   deleteStmt.run(`${guild.id}%`);
-  await loadData(); // Reload to sync Map
+  await loadData();
   await logAction('guildDelete', { guildId: guild.id });
 });
 
-client.on('clientReady', async () => {
+client.on('ready', async () => {
   console.log(`✅ Bot connecté en tant que ${client.user.tag}!`);
   await loadData();
   updateActivity();
@@ -343,16 +343,19 @@ client.on('interactionCreate', async interaction => {
     if (subcommand === 'liste') {
       const serverMap = new Map();
       for (const [frequency, channels] of connectedChannels) {
-        const channelId = channels.values().next().value;
-        const channel = await client.channels.fetch(channelId).catch(() => null);
-        if (!channel) continue;
-        const guildIds = new Set([...channels].map(id => client.channels.cache.get(id)?.guildId).filter(Boolean));
-        serverMap.set(frequency, {
-          name: channel.guild.name,
-          frequency,
-          liaisonCount: guildIds.size,
-          isPrivate: db.prepare('SELECT is_private FROM channels WHERE frequency = ? LIMIT 1').get(frequency)?.is_private || 0
-        });
+        const guildNames = new Set();
+        for (const channelId of channels) {
+          const channel = await client.channels.fetch(channelId).catch(() => null);
+          if (channel) guildNames.add(channel.guild.name);
+        }
+        if (guildNames.size > 0) {
+          serverMap.set(frequency, {
+            names: [...guildNames].join(', '),
+            frequency,
+            liaisonCount: guildNames.size,
+            isPrivate: db.prepare('SELECT is_private FROM channels WHERE frequency = ? LIMIT 1').get(frequency)?.is_private || 0
+          });
+        }
       }
 
       const servers = Array.from(serverMap.values());
@@ -376,11 +379,12 @@ client.on('interactionCreate', async interaction => {
           .setColor('#FFD700')
           .setTimestamp();
         pageServers.forEach(s => {
-          embed.addFields({
-            name: `🏠 ${s.name}`,
-            value: `🔗 Liaisons: ${s.liaisonCount} serveur${s.liaisonCount > 1 ? 's' : ''}\n${s.isPrivate ? '🔒 Privée' : '🌍 Publique'}\n📡 Fréquence: \`\`\`${s.frequency}\`\`\``,
-            inline: false
-          });
+          embed.addFields(
+            { name: `:scroll: Nom du serveur`, value: s.names, inline: false },
+            { name: `:link: Liaisons`, value: `${s.liaisonCount} serveur${s.liaisonCount > 1 ? 's' : ''}`, inline: true },
+            { name: `:earth_africa: Type`, value: `${s.isPrivate ? '🔒 Privée' : '🌍 Publique'}`, inline: true },
+            { name: `:satellite: Fréquence`, value: `\`\`\`${s.frequency}\`\`\``, inline: false }
+          );
         });
         embed.setFooter({ text: `📄 Page ${page + 1}/${totalPages}` });
 
