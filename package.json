@@ -1,6 +1,6 @@
 {
   "name": "EXOINTER",
-  "version": "1.0.0",
+  "version": "1.0.4",
   "description": "Je suis un bot conçu pour discuté grâce à l'interconnexion entre serveurs !",
   "private": true,
   "type": "module",
