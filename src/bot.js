@@ -192,7 +192,7 @@ client.on('guildDelete', async guild => {
   await logAction('guildDelete', { guildId: guild.id });
 });
 
-client.on('ready', async () => {
+client.on('clientReady', async () => {
   console.log(`✅ Bot connecté en tant que ${client.user.tag}!`);
   await loadData();
   updateActivity();
