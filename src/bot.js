@@ -130,7 +130,14 @@ async function getWebhook(channel) {
   }
   const webhooks = await channel.fetchWebhooks();
   let webhook = webhooks.find(w => w.owner.id === client.user.id);
-  if (!webhook) webhook = await channel.createWebhook({ name: 'Interserveur Relay' });
+  if (!webhook) {
+    try {
+      webhook = await channel.createWebhook({ name: 'Interserveur Relay' });
+    } catch (err) {
+      console.error(`❌ Erreur création webhook pour canal ${channel.id}:`, err.message);
+      return null;
+    }
+  }
   const webhookClient = new WebhookClient({ id: webhook.id, token: webhook.token });
   webhookCache.set(channel.id, webhookClient);
   return webhookClient;
@@ -185,16 +192,23 @@ client.on('guildDelete', async guild => {
   await logAction('guildDelete', { guildId: guild.id });
 });
 
-client.on('clientReady', async () => {
+client.on('ready', async () => {
   console.log(`✅ Bot connecté en tant que ${client.user.tag}!`);
   await loadData();
   updateActivity();
 
-  for (const [frequency, channels] of connectedChannels) {
-    if (channels.size === 0) continue;
-    const channelId = channels.values().next().value;
-    const channel = await client.channels.fetch(channelId).catch(() => null);
-    if (channel?.isTextBased() && channel.permissionsFor(client.user).has(['SendMessages', 'EmbedLinks'])) {
+  const guildChannels = new Map();
+  for (const channels of connectedChannels.values()) {
+    for (const channelId of channels) {
+      const channel = await client.channels.fetch(channelId).catch(() => null);
+      if (channel && !guildChannels.has(channel.guildId)) {
+        guildChannels.set(channel.guildId, channel);
+      }
+    }
+  }
+
+  for (const channel of guildChannels.values()) {
+    if (channel.isTextBased() && channel.permissionsFor(client.user).has(['SendMessages', 'EmbedLinks'])) {
       const guildIcon = channel.guild.iconURL({ dynamic: true }) || null;
       const embed = new EmbedBuilder()
         .setTitle('🤖 Bot en ligne !')
@@ -205,9 +219,8 @@ client.on('clientReady', async () => {
           { name: '👥 Utilisateurs', value: `${client.guilds.cache.reduce((acc, guild) => acc + guild.memberCount, 0)}`, inline: true }
         )
         .setColor('#99FF99')
-        .setTimestamp()
-        .setFooter({ text: `Fréquence: ${frequency}` });
-      await channel.send({ embeds: [embed] });
+        .setTimestamp();
+      await channel.send({ embeds: [embed] }).catch(err => console.error(`❌ Erreur envoi embed canal ${channel.id}:`, err.message));
     }
   }
 
@@ -275,7 +288,11 @@ client.on('interactionCreate', async interaction => {
       await Promise.all([...channelSet].map(async channelId => {
         if (channelId !== interaction.channelId) {
           const channel = await client.channels.fetch(channelId).catch(() => null);
-          if (channel?.isTextBased()) await channel.send({ content });
+          if (channel?.isTextBased() && channel.permissionsFor(client.user).has(['SendMessages', 'EmbedLinks'])) {
+            await channel.send({ content }).catch(err => console.error(`❌ Erreur envoi message canal ${channelId}:`, err.message));
+          } else {
+            console.log(`⚠️ Canal ${channelId} inaccessible ou permissions insuffisantes pour fréquence ${frequency}`);
+          }
         }
       }));
 
@@ -306,7 +323,9 @@ client.on('interactionCreate', async interaction => {
 
           await Promise.all([...channels].map(async channelId => {
             const channel = await client.channels.fetch(channelId).catch(() => null);
-            if (channel?.isTextBased()) await channel.send({ content });
+            if (channel?.isTextBased() && channel.permissionsFor(client.user).has(['SendMessages', 'EmbedLinks'])) {
+              await channel.send({ content }).catch(err => console.error(`❌ Erreur envoi message canal ${channelId}:`, err.message));
+            }
           }));
 
           if (channels.size === 0) {
@@ -450,8 +469,14 @@ client.on('messageCreate', async message => {
   if (message.author.bot) return;
 
   const frequency = [...connectedChannels.entries()].find(([_, v]) => v.has(message.channelId))?.[0];
-  if (!frequency) return;
-  if (bannedUsers.has(`${frequency}:${message.author.id}`)) return;
+  if (!frequency) {
+    console.log(`⚠️ Aucun fréquence trouvée pour le canal ${message.channelId}`);
+    return;
+  }
+  if (bannedUsers.has(`${frequency}:${message.author.id}`)) {
+    console.log(`🚫 Utilisateur ${message.author.id} banni de la fréquence ${frequency}`);
+    return;
+  }
 
   if (message.stickers.size > 0) {
     await message.delete().catch(err => console.error('⚠️ Erreur suppression sticker:', err.message));
@@ -459,6 +484,11 @@ client.on('messageCreate', async message => {
   }
 
   const channels = connectedChannels.get(frequency);
+  if (!channels || channels.size === 0) {
+    console.log(`⚠️ Aucun canal valide pour la fréquence ${frequency}`);
+    return;
+  }
+
   const content = encodeMentions(message.content || '');
   const files = Array.from(message.attachments.values())
     .filter(att => att.size <= MAX_FILE_SIZE)
@@ -474,11 +504,17 @@ client.on('messageCreate', async message => {
         const replyContent = `> <@${originalMessage.author.id}> a dit : ${encodeMentions(originalMessage.content || 'Message sans texte')}\n${content}`;
         const webhook = await getWebhook(originalChannel);
         if (webhook) {
-          const sent = await webhook.send({ content: replyContent, username: message.author.username, avatarURL: message.author.displayAvatarURL(), files });
-          relayMap.set(sent.id, { originalId: message.id, originalChannelId: message.channelId, timestamp: Date.now() });
-          for (const { url } of embeds) {
-            await webhook.send({ username: message.author.username, avatarURL: message.author.displayAvatarURL(), files: [url] });
+          const sent = await webhook.send({ content: replyContent, username: message.author.username, avatarURL: message.author.displayAvatarURL(), files })
+            .catch(err => console.error(`❌ Erreur envoi réponse webhook canal ${originalChannel.id}:`, err.message));
+          if (sent) {
+            relayMap.set(sent.id, { originalId: message.id, originalChannelId: message.channelId, timestamp: Date.now() });
+            for (const { url } of embeds) {
+              await webhook.send({ username: message.author.username, avatarURL: message.author.displayAvatarURL(), files: [url] })
+                .catch(err => console.error(`❌ Erreur envoi embed réponse webhook canal ${originalChannel.id}:`, err.message));
+            }
           }
+        } else {
+          console.log(`⚠️ Webhook non disponible pour le canal ${originalChannel?.id || relayInfo.originalChannelId}`);
         }
       }
       return;
@@ -488,23 +524,41 @@ client.on('messageCreate', async message => {
   await Promise.all([...channels].map(async channelId => {
     if (channelId !== message.channelId) {
       const channel = await client.channels.fetch(channelId).catch(() => null);
-      if (!channel?.isTextBased()) return;
+      if (!channel?.isTextBased()) {
+        console.log(`⚠️ Canal ${channelId} non textuel ou inaccessible`);
+        return;
+      }
+
+      if (!channel.permissionsFor(client.user).has(['SendMessages', 'EmbedLinks'])) {
+        console.log(`⚠️ Permissions insuffisantes pour le canal ${channelId}`);
+        return;
+      }
 
       const webhook = await getWebhook(channel);
-      if (!webhook) return;
+      if (!webhook) {
+        console.log(`⚠️ Impossible de créer/obtenir webhook pour le canal ${channelId}`);
+        return;
+      }
 
       const sent = await webhook.send({
         content: message.channel.isThread() ? `[Thread: ${message.channel.name}]\n${content}` : content,
         username: message.author.username,
         avatarURL: message.author.displayAvatarURL(),
         files
+      }).catch(err => {
+        console.error(`❌ Erreur envoi webhook canal ${channelId}:`, err.message);
+        return null;
       });
 
-      for (const { url } of embeds) {
-        await webhook.send({ username: message.author.username, avatarURL: message.author.displayAvatarURL(), files: [url] });
+      if (sent) {
+        relayMap.set(sent.id, { originalId: message.id, originalChannelId: message.channelId, timestamp: Date.now() });
+        for (const { url } of embeds) {
+          await webhook.send({ username: message.author.username, avatarURL: message.author.displayAvatarURL(), files: [url] })
+            .catch(err => console.error(`❌ Erreur envoi embed webhook canal ${channelId}:`, err.message));
+        }
+      } else {
+        console.log(`⚠️ Échec de l'envoi du message dans le canal ${channelId}`);
       }
-
-      relayMap.set(sent.id, { originalId: message.id, originalChannelId: message.channelId, timestamp: Date.now() });
     }
   }));
 });
