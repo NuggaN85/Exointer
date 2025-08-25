@@ -303,9 +303,12 @@ client.on('interactionCreate', async interaction => {
 
   if (subcommand === 'liste') {
     const serverMap = new Map();
-    for (const [frequency, channels] of connectedChannels) {
-      const { creator_guild = 'Inconnu' } = db.prepare('SELECT creator_guild FROM channels WHERE frequency = ? LIMIT 1').get(frequency) || {};
-      serverMap.set(frequency, { frequency, liaisonCount: channels.size, creatorGuild: creator_guild });
+    const stmt = db.prepare('SELECT frequency, creator_guild FROM channels GROUP BY frequency, creator_guild');
+    const creators = stmt.all();
+    for (const { frequency, creator_guild } of creators) {
+      if (!serverMap.has(frequency)) serverMap.set(frequency, { frequency, creators: [], liaisonCount: 0 });
+      serverMap.get(frequency).creators.push(creator_guild);
+      serverMap.get(frequency).liaisonCount = (serverMap.get(frequency).liaisonCount || 0) + 1;
     }
 
     const servers = Array.from(serverMap.values()).sort((a, b) => a.frequency.localeCompare(b.frequency));
@@ -326,7 +329,7 @@ client.on('interactionCreate', async interaction => {
         .setFooter({ text: `Page ${page + 1}/${totalPages}` });
 
       pageServers.forEach(s => embed.addFields(
-        { name: '👑 Créateur', value: s.creatorGuild },
+        { name: '👑 Créateurs', value: s.creators.join(', ') || 'Inconnu' },
         { name: '📡 Fréquence', value: `\`\`\`${s.frequency}\`\`\`` },
         { name: '🔗 Liaisons', value: `${s.liaisonCount} serveur${s.liaisonCount > 1 ? 's' : ''}` },
         { name: '\u200b', value: '\u200b' }
