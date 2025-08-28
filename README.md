@@ -43,7 +43,7 @@ Le bot utilise des commandes slash pour interagir avec les utilisateurs. Voici l
 - `/interserveur generer` : Génère une nouvelle fréquence pour un inter-serveur.
 - `/interserveur lier <frequence>` : Lie le canal actuel à une fréquence existante.
 - `/interserveur gerer` : Affiche la fréquence du canal actuel.
-- `/interserveur liste` : Affiche la liste des serveurs ayant généré une fréquence.
+- `/listefrequences` : Affiche la liste des serveurs ayant généré une fréquence.
 - `/interserveur delier` : Délie le canal actuel de sa fréquence.
 
 ## Utilisation
