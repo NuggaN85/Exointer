@@ -1,13 +1,15 @@
 'use strict';
-import { Client, GatewayIntentBits, SlashCommandBuilder, REST, Routes, EmbedBuilder, ActivityType, PermissionsBitField, WebhookClient } from 'discord.js';
+import { Client, GatewayIntentBits, SlashCommandBuilder, REST, Routes, EmbedBuilder, ActivityType, PermissionsBitField, WebhookClient, ActionRowBuilder, ButtonBuilder, ButtonStyle } from 'discord.js';
 import Database from 'better-sqlite3';
 import * as dotenv from 'dotenv';
 import { v4 as uuidv4 } from 'uuid';
 dotenv.config();
+
 if (!process.env.DISCORD_TOKEN || !process.env.CLIENT_ID) {
   console.error('⚠️ DISCORD_TOKEN et CLIENT_ID requis.');
   process.exit(1);
 }
+
 const client = new Client({
   intents: [
     GatewayIntentBits.Guilds,
@@ -16,13 +18,16 @@ const client = new Client({
     GatewayIntentBits.GuildMessageReactions
   ]
 });
+
 const db = new Database('./data.db', { verbose: console.log });
 const connectedChannels = new Map();
+const frequencyCreators = new Map();
 const relayMap = new Map();
 const bannedUsers = new Set();
 const MAX_FILE_SIZE = 8 * 1024 * 1024; // 8 Mo
 const RELAY_MAP_TTL = 24 * 60 * 60 * 1000; // 24h
 const SAVE_INTERVAL = 5 * 60 * 1000; // 5 minutes
+
 const LANGUAGES = {
   fr: {
     connected: '🔗 Salon connecté à **{frequency}** : {guild} ({channel})',
@@ -33,12 +38,14 @@ const LANGUAGES = {
     already_generated: '⚠️ Ce serveur a déjà généré une fréquence. Utilisez `/interserveur gerer` pour voir votre fréquence.'
   }
 };
+
 // Initialize database
 db.exec(`
   CREATE TABLE IF NOT EXISTS channels (
     frequency TEXT,
     channel_id TEXT,
     guild_id TEXT,
+    is_creator BOOLEAN DEFAULT FALSE,
     PRIMARY KEY (frequency, channel_id)
   );
   CREATE TABLE IF NOT EXISTS logs (
@@ -53,20 +60,36 @@ db.exec(`
     PRIMARY KEY (frequency, user_id)
   );
 `);
+
 const encodeMentions = content => content
   ? content
       .replace(/@(everyone|here)/g, '@\u200b$1')
       .replace(/<@&?(\d{17,20})>/g, '<@\u200b$1>')
   : '';
+
 const webhookCache = new Map();
+
 const loadData = async () => {
   try {
     connectedChannels.clear();
+    frequencyCreators.clear();
     bannedUsers.clear();
     const channels = db.prepare('SELECT frequency, channel_id FROM channels').all();
     for (const { frequency, channel_id } of channels) {
       if (!connectedChannels.has(frequency)) connectedChannels.set(frequency, new Set());
       connectedChannels.get(frequency).add(channel_id);
+    }
+    const creators = db.prepare('SELECT frequency, channel_id FROM channels WHERE is_creator = 1').all();
+    for (const { frequency, channel_id } of creators) {
+      frequencyCreators.set(frequency, channel_id);
+    }
+    // Handle migration: set first channel as creator if none
+    for (const [frequency, channels] of connectedChannels.entries()) {
+      if (!frequencyCreators.has(frequency) && channels.size > 0) {
+        const firstChannelId = [...channels][0];
+        frequencyCreators.set(frequency, firstChannelId);
+        db.prepare('UPDATE channels SET is_creator = 1 WHERE frequency = ? AND channel_id = ?').run(frequency, firstChannelId);
+      }
     }
     const bans = db.prepare('SELECT frequency, user_id FROM banned_users').all();
     for (const { frequency, user_id } of bans) {
@@ -77,15 +100,17 @@ const loadData = async () => {
     console.error('❌ Erreur chargement SQLite:', error.message);
   }
 };
+
 const saveData = async () => {
   try {
     const transaction = db.transaction(() => {
       db.prepare('DELETE FROM channels').run();
-      const insertChannel = db.prepare('INSERT OR REPLACE INTO channels (frequency, channel_id, guild_id) VALUES (?, ?, ?)');
+      const insertChannel = db.prepare('INSERT OR REPLACE INTO channels (frequency, channel_id, guild_id, is_creator) VALUES (?, ?, ?, ?)');
       for (const [frequency, channels] of connectedChannels) {
+        const creatorId = frequencyCreators.get(frequency);
         for (const channelId of channels) {
           const channel = client.channels.cache.get(channelId);
-          insertChannel.run(frequency, channelId, channel?.guild?.id || 'Inconnu');
+          insertChannel.run(frequency, channelId, channel?.guild?.id || 'Inconnu', channelId === creatorId ? 1 : 0);
         }
       }
     });
@@ -95,6 +120,7 @@ const saveData = async () => {
     console.error('❌ Erreur sauvegarde SQLite:', error);
   }
 };
+
 const logAction = async (action, details) => {
   try {
     db.prepare('INSERT INTO logs (timestamp, action, details) VALUES (?, ?, ?)').run(new Date().toISOString(), action, JSON.stringify(details));
@@ -102,13 +128,16 @@ const logAction = async (action, details) => {
     console.error('❌ Erreur sauvegarde log:', error);
   }
 };
+
 setInterval(() => {
   const now = Date.now();
   for (const [id, { timestamp }] of relayMap) {
     if (now - timestamp > RELAY_MAP_TTL) relayMap.delete(id);
   }
 }, 60 * 60 * 1000);
+
 setInterval(saveData, SAVE_INTERVAL);
+
 const getWebhook = async channel => {
   if (webhookCache.has(channel.id)) return webhookCache.get(channel.id);
   if (!channel.permissionsFor(client.user).has(PermissionsBitField.Flags.ManageWebhooks)) {
@@ -127,7 +156,9 @@ const getWebhook = async channel => {
     return null;
   }
 };
+
 const updateActivity = () => client.user.setActivity(`Je suis sur ${client.guilds.cache.size} serveurs`, { type: ActivityType.Custom });
+
 const commands = [
   new SlashCommandBuilder()
     .setName('interserveur')
@@ -154,6 +185,7 @@ const commands = [
     .setDescription('Liste les fréquences avec le nom du serveur et le nombre de serveurs liés')
     .setDefaultMemberPermissions(PermissionsBitField.Flags.ManageChannels)
 ].map(cmd => cmd.toJSON());
+
 client.on('guildCreate', updateActivity);
 client.on('guildDelete', async guild => {
   updateActivity();
@@ -161,7 +193,8 @@ client.on('guildDelete', async guild => {
   await loadData();
   await logAction('guildDelete', { guildId: guild.id });
 });
-client.on('ready', async () => {
+
+client.on('clientReady', async () => {
   console.log(`✅ Connecté en tant que ${client.user.tag}`);
   await loadData();
   updateActivity();
@@ -195,7 +228,9 @@ client.on('ready', async () => {
     console.error('❌ Erreur commandes:', error);
   }
 });
-const ITEMS_PER_PAGE = 10;
+
+const ITEMS_PER_PAGE = 8;
+
 client.on('interactionCreate', async interaction => {
   if (!interaction.isCommand() || interaction.replied || interaction.deferred) return;
   if (!interaction.memberPermissions.has(PermissionsBitField.Flags.ManageChannels)) {
@@ -218,10 +253,12 @@ client.on('interactionCreate', async interaction => {
         }
         const frequency = uuidv4().slice(0, 8);
         connectedChannels.set(frequency, new Set([interaction.channelId]));
-        db.prepare('INSERT INTO channels (frequency, channel_id, guild_id) VALUES (?, ?, ?)').run(
+        frequencyCreators.set(frequency, interaction.channelId);
+        db.prepare('INSERT INTO channels (frequency, channel_id, guild_id, is_creator) VALUES (?, ?, ?, ?)').run(
           frequency, 
           interaction.channelId, 
-          interaction.guildId
+          interaction.guildId,
+          1
         );
         await saveData();
         await interaction.editReply({ content: `📡 Fréquence générée : **${frequency}**` });
@@ -233,10 +270,11 @@ client.on('interactionCreate', async interaction => {
         if (!channelSet) return interaction.editReply({ content: LANGUAGES.fr.invalid_frequency });
         if (channelSet.has(interaction.channelId)) return interaction.editReply({ content: '⚠️ Salon déjà lié.' });
         channelSet.add(interaction.channelId);
-        db.prepare('INSERT INTO channels (frequency, channel_id, guild_id) VALUES (?, ?, ?)').run(
+        db.prepare('INSERT INTO channels (frequency, channel_id, guild_id, is_creator) VALUES (?, ?, ?, ?)').run(
           frequency, 
           interaction.channelId, 
-          interaction.guildId
+          interaction.guildId,
+          0
         );
         await saveData();
         await interaction.editReply({ content: `🔗 Salon lié à **${frequency}**.` });
@@ -271,7 +309,10 @@ client.on('interactionCreate', async interaction => {
                 await channel.send({ content }).catch(err => console.error(`❌ Erreur envoi message canal ${channelId}:`, err.message));
               }
             }));
-            if (channels.size === 0) connectedChannels.delete(frequency);
+            if (channels.size === 0) {
+              connectedChannels.delete(frequency);
+              frequencyCreators.delete(frequency);
+            }
             await saveData();
             await logAction('unlink', { frequency, channel: interaction.channelId, guild: interaction.guildId });
             break;
@@ -290,11 +331,17 @@ client.on('interactionCreate', async interaction => {
       }
     } else if (commandName === 'listefrequences') {
       const frequencies = [...connectedChannels.entries()]
-        .map(([freq, channels]) => ({
-          frequency: freq,
-          serverName: client.channels.cache.get([...channels][0])?.guild.name || 'Inconnu',
-          serverCount: channels.size
-        }))
+        .map(([freq, channels]) => {
+          const creatorChannelId = frequencyCreators.get(freq);
+          const channel = creatorChannelId ? client.channels.cache.get(creatorChannelId) : null;
+          const serverName = channel?.guild?.name || 'Serveur Inconnu';
+          
+          return {
+            frequency: freq,
+            serverName: serverName,
+            serverCount: channels.size
+          };
+        })
         .sort((a, b) => b.serverCount - a.serverCount);
 
       const totalPages = Math.ceil(frequencies.length / ITEMS_PER_PAGE);
@@ -303,69 +350,86 @@ client.on('interactionCreate', async interaction => {
       const generateEmbed = (pageNum) => {
         const start = pageNum * ITEMS_PER_PAGE;
         const pageItems = frequencies.slice(start, start + ITEMS_PER_PAGE);
+        
         const embed = new EmbedBuilder()
-          .setTitle('📡 Liste des Fréquences')
-          .setDescription(pageItems.length ? pageItems.map(item => `**${item.frequency}** - ${item.serverName} (${item.serverCount} serveurs)`).join('\n') : 'Aucune fréquence trouvée.')
-          .setColor('#00AAFF')
-          .setFooter({ text: `Page ${pageNum + 1}/${totalPages}` })
+          .setTitle('📡 LISTE DES FRÉQUENCES INTER-SERVEURS')
+          .setDescription(`**${frequencies.length}** fréquences actives • **${frequencies.reduce((acc, item) => acc + item.serverCount, 0)}** connexions totales`)
+          .setColor('#0099FF')
+          .setFooter({ 
+            text: `Page ${pageNum + 1}/${totalPages} • ${client.guilds.cache.size} serveurs connectés`,
+            iconURL: client.user.displayAvatarURL()
+          })
           .setTimestamp();
+
+        if (pageItems.length > 0) {
+          embed.addFields({
+            name: '📊 FRÉQUENCES ACTIVES',
+            value: pageItems.map(item => 
+              `**${item.frequency}** - ${item.serverName}\n└── 🔗 ${item.serverCount} serveur${item.serverCount > 1 ? 's' : ''} connecté${item.serverCount > 1 ? 's' : ''}`
+            ).join('\n\n')
+          });
+        } else {
+          embed.setDescription('🔍 Aucune fréquence active trouvée.\nUtilisez `/interserveur generer` pour créer une nouvelle fréquence.');
+        }
+
         return embed;
       };
 
       const generateButtons = (pageNum) => {
-        return [
-          {
-            type: 2,
-            style: 1,
-            label: 'Retour',
-            custom_id: 'prev_page',
-            disabled: pageNum === 0
-          },
-          {
-            type: 2,
-            style: 2,
-            label: `${pageNum + 1}/${totalPages}`,
-            custom_id: 'page_info',
-            disabled: true
-          },
-          {
-            type: 2,
-            style: 1,
-            label: 'Suivant',
-            custom_id: 'next_page',
-            disabled: pageNum === totalPages - 1
-          }
-        ];
+        return new ActionRowBuilder()
+          .addComponents(
+            new ButtonBuilder()
+              .setCustomId('prev_page')
+              .setLabel('◄ Précédent')
+              .setStyle(ButtonStyle.Primary)
+              .setDisabled(pageNum === 0),
+            new ButtonBuilder()
+              .setCustomId('page_info')
+              .setLabel(`Page ${pageNum + 1}/${totalPages}`)
+              .setStyle(ButtonStyle.Secondary)
+              .setDisabled(true),
+            new ButtonBuilder()
+              .setCustomId('next_page')
+              .setLabel('Suivant ►')
+              .setStyle(ButtonStyle.Primary)
+              .setDisabled(pageNum === totalPages - 1)
+          );
       };
 
       const message = await interaction.editReply({
         embeds: [generateEmbed(page)],
-        components: totalPages > 1 ? [{ type: 1, components: generateButtons(page) }] : []
+        components: totalPages > 1 ? [generateButtons(page)] : []
       });
 
-      const collector = message.createMessageComponentCollector({ time: 60000 });
-
-      collector.on('collect', async i => {
-        if (i.user.id !== interaction.user.id) {
-          return i.reply({ content: '❌ Cette interaction ne vous appartient pas.', ephemeral: true });
-        }
-        if (i.customId === 'prev_page' && page > 0) page--;
-        if (i.customId === 'next_page' && page < totalPages - 1) page++;
-        await i.update({
-          embeds: [generateEmbed(page)],
-          components: totalPages > 1 ? [{ type: 1, components: generateButtons(page) }] : []
+      if (totalPages > 1) {
+        const collector = message.createMessageComponentCollector({ 
+          filter: i => i.user.id === interaction.user.id,
+          time: 120000 
         });
-      });
 
-      collector.on('end', () => {
-        interaction.editReply({ components: [] }).catch(() => {});
-      });
+        collector.on('collect', async i => {
+          if (i.customId === 'prev_page' && page > 0) page--;
+          if (i.customId === 'next_page' && page < totalPages - 1) page++;
+          
+          await i.update({
+            embeds: [generateEmbed(page)],
+            components: [generateButtons(page)]
+          });
+        });
+
+        collector.on('end', () => {
+          interaction.editReply({ 
+            components: [] 
+          }).catch(() => {});
+        });
+      }
     }
   } catch (err) {
     console.error('❌ Erreur interaction:', err.message);
     await interaction.editReply({ content: '❌ Une erreur est survenue.' }).catch(() => {});
   }
 });
+
 client.on('messageCreate', async message => {
   if (message.author.bot || message.stickers.size > 0) {
     if (message.stickers.size > 0) await message.delete().catch(err => console.error('⚠️ Erreur suppression sticker:', err.message));
@@ -378,6 +442,8 @@ client.on('messageCreate', async message => {
   const content = encodeMentions(message.content || '');
   const files = Array.from(message.attachments.values()).filter(att => att.size <= MAX_FILE_SIZE).map(att => att.url);
   const embeds = message.embeds.filter(e => e.image?.url).map(e => ({ url: e.image.url }));
+  const guildName = message.guild?.name || 'Serveur Inconnu';
+  
   if (message.reference?.messageId) {
     const relayed = relayMap.get(message.reference.messageId);
     if (relayed) {
@@ -387,13 +453,20 @@ client.on('messageCreate', async message => {
         const replyContent = `> <@${originalMessage.author.id}> : ${encodeMentions(originalMessage.content || 'Message sans texte')}\n${content}`;
         const webhook = await getWebhook(originalChannel);
         if (webhook) {
-          const sent = await webhook.send({ content: replyContent, username: message.author.username, avatarURL: message.author.displayAvatarURL(), files })
-            .catch(err => console.error(`❌ Erreur envoi réponse webhook canal ${originalChannel.id}:`, err.message));
+          const sent = await webhook.send({ 
+            content: replyContent, 
+            username: `${message.author.username} (${guildName})`, 
+            avatarURL: message.author.displayAvatarURL(), 
+            files 
+          }).catch(err => console.error(`❌ Erreur envoi réponse webhook canal ${originalChannel.id}:`, err.message));
           if (sent) {
             relayMap.set(sent.id, { originalId: message.id, originalChannelId: message.channelId, timestamp: Date.now() });
             for (const { url } of embeds) {
-              await webhook.send({ username: message.author.username, avatarURL: message.author.displayAvatarURL(), files: [url] })
-                .catch(err => console.error(`❌ Erreur envoi embed réponse webhook canal ${originalChannel.id}:`, err.message));
+              await webhook.send({ 
+                username: `${message.author.username} (${guildName})`, 
+                avatarURL: message.author.displayAvatarURL(), 
+                files: [url] 
+              }).catch(err => console.error(`❌ Erreur envoi embed réponse webhook canal ${originalChannel.id}:`, err.message));
             }
           }
         }
@@ -401,6 +474,7 @@ client.on('messageCreate', async message => {
       return;
     }
   }
+  
   await Promise.all([...channels].map(async channelId => {
     if (channelId === message.channelId) return;
     const channel = await client.channels.fetch(channelId).catch(() => null);
@@ -409,7 +483,7 @@ client.on('messageCreate', async message => {
     if (!webhook) return;
     const sent = await webhook.send({
       content: message.channel.isThread() ? `[Thread: ${message.channel.name}] ${content}` : content,
-      username: message.author.username,
+      username: `${message.author.username} (${guildName})`,
       avatarURL: message.author.displayAvatarURL(),
       files
     }).catch(err => {
@@ -419,12 +493,16 @@ client.on('messageCreate', async message => {
     if (sent) {
       relayMap.set(sent.id, { originalId: message.id, originalChannelId: message.channelId, timestamp: Date.now() });
       for (const { url } of embeds) {
-        await webhook.send({ username: message.author.username, avatarURL: message.author.displayAvatarURL(), files: [url] })
-          .catch(err => console.error(`❌ Erreur envoi embed webhook canal ${channelId}:`, err.message));
+        await webhook.send({ 
+          username: `${message.author.username} (${guildName})`, 
+          avatarURL: message.author.displayAvatarURL(), 
+          files: [url] 
+        }).catch(err => console.error(`❌ Erreur envoi embed webhook canal ${channelId}:`, err.message));
       }
     }
   }));
 });
+
 client.on('messageReactionAdd', async (reaction, user) => {
   if (user.bot) return;
   const { message } = reaction;
@@ -444,6 +522,7 @@ client.on('messageReactionAdd', async (reaction, user) => {
     }
   }));
 });
+
 client.on('messageReactionRemove', async (reaction, user) => {
   if (user.bot) return;
   const { message } = reaction;
@@ -466,6 +545,7 @@ client.on('messageReactionRemove', async (reaction, user) => {
     }
   }));
 });
+
 const handleExit = signal => {
   try {
     saveData();
@@ -477,6 +557,7 @@ const handleExit = signal => {
     process.exit(1);
   }
 };
+
 process.on('SIGINT', () => handleExit('SIGINT'));
 process.on('SIGTERM', () => handleExit('SIGTERM'));
 process.on('uncaughtException', err => {
@@ -487,6 +568,7 @@ process.on('unhandledRejection', err => {
   console.error('❌ Erreur non gérée:', err);
   handleExit('unhandledRejection');
 });
+
 client.login(process.env.DISCORD_TOKEN).catch(error => {
   console.error('❌ Erreur connexion système:', error);
   process.exit(1);
