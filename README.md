@@ -1,4 +1,4 @@
-**`Mise à jour : version 1.0.4`**
+**`Mise à jour : version 1.0.5`**
 
 # Exointer Discord Bot
 
