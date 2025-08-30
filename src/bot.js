@@ -55,7 +55,7 @@ const loadData = async () => {
     for (const { channel_id } of channels) {
       connectedChannels.add(channel_id);
     }
-    console.log('📂 Données chargées depuis SQLite');
+    console.log('✅ Données chargées depuis SQLite');
   } catch (error) {
     console.error('❌ Erreur chargement SQLite:', error.message);
   }
@@ -127,14 +127,14 @@ client.on('guildDelete', async guild => {
   await loadData();
 });
 
-client.on('ready', async () => {
+client.on('clientReady', async () => {
   console.log(`✅ Connecté en tant que ${client.user.tag}`);
   await loadData();
   updateActivity();
   const rest = new REST({ version: '10' }).setToken(process.env.DISCORD_TOKEN);
   try {
     await rest.put(Routes.applicationCommands(process.env.CLIENT_ID), { body: commands });
-    console.log('📡 Commandes enregistrées');
+    console.log('✅ Commandes enregistrées');
   } catch (error) {
     console.error('❌ Erreur commandes:', error);
   }
