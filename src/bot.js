@@ -20,11 +20,13 @@ const client = new Client({
 });
 
 const db = new Database('./data.db', { verbose: console.log });
-const connectedChannels = new Map(); // guildId -> { channelId, frequencies: Map<freq, {linkedGuilds: Set<guildId>, bannedGuilds: Set<guildId>, key: string|null}> }
+const connectedChannels = new Map(); // guildId -> { channelId, frequencies: Map<freq, {linkedGuilds: Set<guildId>, bannedGuilds: Set<guildId>, key: string|null}>, timestamp: number }
 const relayMap = new Map();
 const MAX_FILE_SIZE = 8 * 1024 * 1024; // 8 Mo
 const RELAY_MAP_TTL = 24 * 60 * 60 * 1000; // 24h
 const SAVE_INTERVAL = 5 * 60 * 1000; // 5 minutes
+const WEBHOOK_CACHE_TTL = 60 * 60 * 1000; // 1 heure
+const CONNECTED_CHANNELS_TTL = 24 * 60 * 60 * 1000; // 24 heures
 const ITEMS_PER_PAGE = 10;
 
 const LANGUAGES = {
@@ -76,14 +78,14 @@ const encodeMentions = content => content
       .replace(/<@&?(\d{17,20})>/g, '<@\u200b$1>')
   : '';
 
-const webhookCache = new Map();
+const webhookCache = new Map(); // channelId -> { webhook: WebhookClient, timestamp: number }
 
 const loadData = async () => {
   try {
     connectedChannels.clear();
     const guilds = db.prepare('SELECT * FROM guilds').all();
     for (const { guild_id, channel_id } of guilds) {
-      connectedChannels.set(guild_id, { channelId: channel_id, frequencies: new Map() });
+      connectedChannels.set(guild_id, { channelId: channel_id, frequencies: new Map(), timestamp: Date.now() });
     }
     const freqs = db.prepare('SELECT * FROM frequencies').all();
     for (const { freq, owner_guild_id, key } of freqs) {
@@ -130,6 +132,8 @@ const saveData = async () => {
           for (const linked of linkedGuilds) insertLink.run(freq, linked);
           for (const banned of bannedGuilds) insertBan.run(freq, banned);
         }
+        // Mettre à jour le timestamp
+        connectedChannels.get(guildId).timestamp = Date.now();
       }
     });
     transaction();
@@ -146,10 +150,42 @@ setInterval(() => {
   }
 }, 60 * 60 * 1000);
 
+setInterval(() => {
+  const now = Date.now();
+  // Nettoyage webhookCache
+  for (const [channelId, { timestamp }] of webhookCache) {
+    if (now - timestamp > WEBHOOK_CACHE_TTL) {
+      webhookCache.delete(channelId);
+    }
+  }
+  // Nettoyage connectedChannels
+  for (const [guildId, { timestamp }] of connectedChannels) {
+    if (now - timestamp > CONNECTED_CHANNELS_TTL) {
+      connectedChannels.delete(guildId);
+      // Supprimer les données associées dans SQLite
+      const deletes = [
+        'DELETE FROM links WHERE linked_guild_id = ?',
+        'DELETE FROM bans WHERE banned_guild_id = ?',
+        'DELETE FROM links WHERE freq IN (SELECT freq FROM frequencies WHERE owner_guild_id = ?)',
+        'DELETE FROM bans WHERE freq IN (SELECT freq FROM frequencies WHERE owner_guild_id = ?)',
+        'DELETE FROM frequencies WHERE owner_guild_id = ?',
+        'DELETE FROM guilds WHERE guild_id = ?'
+      ];
+      for (const query of deletes) {
+        db.prepare(query).run(guildId);
+      }
+    }
+  }
+}, 60 * 60 * 1000); // Vérification toutes les heures
+
 setInterval(saveData, SAVE_INTERVAL);
 
 const getWebhook = async channel => {
-  if (webhookCache.has(channel.id)) return webhookCache.get(channel.id);
+  if (webhookCache.has(channel.id)) {
+    const cached = webhookCache.get(channel.id);
+    cached.timestamp = Date.now(); // Mettre à jour le timestamp
+    return cached.webhook;
+  }
   if (!channel.permissionsFor(client.user).has(PermissionsBitField.Flags.ManageWebhooks)) {
     console.warn(`⚠️ Permissions insuffisantes pour webhooks dans ${channel.id} (serveur ${channel.guild?.name || 'Inconnu'})`);
     return null;
@@ -159,7 +195,7 @@ const getWebhook = async channel => {
     let webhook = webhooks.find(w => w.owner.id === client.user.id);
     if (!webhook) webhook = await channel.createWebhook({ name: 'Interserveur Relay' });
     const webhookClient = new WebhookClient({ id: webhook.id, token: webhook.token });
-    webhookCache.set(channel.id, webhookClient);
+    webhookCache.set(channel.id, { webhook: webhookClient, timestamp: Date.now() });
     return webhookClient;
   } catch (err) {
     console.error(`❌ Erreur création webhook pour canal ${channel.id} (serveur ${channel.guild?.name || 'Inconnu'}):`, err.message);
@@ -250,7 +286,7 @@ client.on('guildDelete', async guild => {
   await saveData();
 });
 
-client.on('ready', async () => {
+client.on('clientReady', async () => {
   console.log(`✅ Connecté en tant que ${client.user.tag}`);
   await loadData();
   updateActivity();
@@ -281,7 +317,7 @@ client.on('interactionCreate', async interaction => {
         const key = type === 'prive' ? randomBytes(16).toString('hex') : null;
         let guildData = connectedChannels.get(guildId);
         if (!guildData) {
-          guildData = { channelId, frequencies: new Map() };
+          guildData = { channelId, frequencies: new Map(), timestamp: Date.now() };
           connectedChannels.set(guildId, guildData);
         }
         guildData.frequencies.set(freq, { linkedGuilds: new Set(), bannedGuilds: new Set(), key });
