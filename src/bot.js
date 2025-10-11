@@ -4,22 +4,19 @@ import Database from 'better-sqlite3';
 import * as dotenv from 'dotenv';
 import { bold, green, blue, yellow, red, magenta, cyan, white, gray } from 'kleur/colors';
 dotenv.config();
-
 if (!process.env.DISCORD_TOKEN || !process.env.CLIENT_ID) {
   console.error(red('⚠️ DISCORD_TOKEN et CLIENT_ID requis.'));
   process.exit(1);
 }
-
 const client = new Client({
   intents: [
     GatewayIntentBits.Guilds,
     GatewayIntentBits.GuildMembers,
     GatewayIntentBits.GuildMessages,
-    GatewayIntentBits.GuildMessageReactions,
     GatewayIntentBits.MessageContent,
+    GatewayIntentBits.GuildMessageReactions,
   ]
 });
-
 const MAX_FILE_SIZE = 8 * 1024 * 1024; // 8 Mo
 const RELAY_MAP_TTL = 24 * 60 * 60 * 1000; // 24h
 const SAVE_INTERVAL = 5 * 60 * 1000; // 5 min
@@ -27,14 +24,18 @@ const WEBHOOK_CACHE_TTL = 60 * 60 * 1000; // 1h
 const CONNECTED_CHANNELS_TTL = 24 * 60 * 60 * 1000; // 24h
 const PROCESSING_DELAY = 100; // 100ms
 const HEALTH_CHECK_INTERVAL = 30 * 60 * 1000; // 30 min
-
+const MENTION_CACHE_TTL = 60 * 60 * 1000; // 1h
+const MAX_MENTIONS_PER_MESSAGE = 10;
+const MAX_CONCURRENT_MESSAGES = 5;
+const MAX_CACHE_SIZE = 10000;
 const db = new Database('./data.db');
-const connectedChannels = new Map(); // Stocke guildId => { channelId, timestamp }
+const connectedChannels = new Map();
 const relayMap = new Map();
 const webhookCache = new Map();
 const messageQueue = new Map();
 const rateLimits = new Map();
-
+const permissionCache = new Map();
+const mentionCache = new Map();
 const logger = {
   info: (message, data = {}) => console.log(blue(`[${new Date().toISOString()}] 📝 ${message}`), Object.keys(data).length ? gray(JSON.stringify(data)) : ''),
   warn: (message, data = {}) => console.warn(yellow(`[${new Date().toISOString()}] ⚠️ ${message}`), Object.keys(data).length ? gray(JSON.stringify(data)) : ''),
@@ -44,7 +45,6 @@ const logger = {
   system: (message, data = {}) => console.log(magenta(`[${new Date().toISOString()}] 🚀 ${message}`), Object.keys(data).length ? gray(JSON.stringify(data)) : ''),
   database: (message, data = {}) => console.log(cyan(`[${new Date().toISOString()}] 💾 ${message}`), Object.keys(data).length ? gray(JSON.stringify(data)) : '')
 };
-
 const stats = {
   startTime: Date.now(),
   messagesSent: 0,
@@ -77,26 +77,25 @@ const stats = {
   printStats: () => {
     const summary = stats.getSummary();
     console.log('\n' + bold(blue('📊 STATISTIQUES DU BOT INTERSERVEUR')));
-    console.log(blue('═'.repeat(50)));
+    console.log(blue('══════════════════════════════════════════════════'));
     console.log(green('🕒 Uptime:'), white(summary.uptime));
     console.log(green('🏠 Serveurs:'), white(summary.servers));
     console.log(green('🔗 Canaux connectés:'), white(summary.connectedChannels));
-    console.log(blue('─'.repeat(30)));
+    console.log(blue('──────────────────────────────'));
     console.log(cyan('📨 Messages envoyés:'), white(summary.messagesSent));
     console.log(cyan('📩 Messages reçus:'), white(summary.messagesReceived));
     console.log(cyan('⚡ Commandes exécutées:'), white(summary.commandsExecuted));
-    console.log(blue('─'.repeat(30)));
+    console.log(blue('──────────────────────────────'));
     console.log(magenta('🪝 Webhooks créés:'), white(summary.webhooksCreated));
     console.log(magenta('🗺️ Relay Map:'), white(summary.relayMapSize));
     console.log(magenta('💾 Webhook Cache:'), white(summary.webhookCacheSize));
     console.log(magenta('📋 Files d\'attente:'), white(summary.messageQueues));
-    console.log(blue('─'.repeat(30)));
+    console.log(blue('──────────────────────────────'));
     console.log(yellow('❌ Erreurs:'), summary.errors > 0 ? red(summary.errors) : yellow(summary.errors));
     console.log(yellow('💾 Mémoire:'), white(summary.memoryUsage));
-    console.log(blue('═'.repeat(50)) + '\n');
+    console.log(blue('══════════════════════════════════════════════════') + '\n');
   }
 };
-
 const checkRateLimit = (userId, action, limit = 5, window = 60000) => {
   const key = `${userId}:${action}`;
   const now = Date.now();
@@ -106,7 +105,6 @@ const checkRateLimit = (userId, action, limit = 5, window = 60000) => {
   rateLimits.set(key, validLimits);
   return validLimits.length <= limit;
 };
-
 const LANGUAGES = {
   fr: {
     connected: '🔗 Salon configuré : {channel}. Connexion automatique au réseau.',
@@ -116,46 +114,81 @@ const LANGUAGES = {
     wrong_channel: '❌ Cette commande doit être exécutée dans le salon configuré pour le réseau inter-serveur.'
   }
 };
-
 db.exec(`
   CREATE TABLE IF NOT EXISTS guilds (
     guild_id TEXT PRIMARY KEY,
     channel_id TEXT,
     created_at DATETIME DEFAULT CURRENT_TIMESTAMP
   );
+  CREATE INDEX IF NOT EXISTS idx_guild_id ON guilds(guild_id);
 `);
-
+const measureDbLatency = () => {
+  const start = Date.now();
+  try {
+    db.prepare('SELECT 1').get();
+    return Date.now() - start;
+  } catch (error) {
+    logger.error('Erreur mesure latence DB', error);
+    return -1;
+  }
+};
 const resolveMentions = async (content, guild) => {
   if (!content || typeof content !== 'string') return '';
   let resolvedContent = content;
-  const userMentions = content.match(/<@!?(\d{17,20})>/g) || [];
+  const userMentions = (content.match(/<@!?(\d{17,20})>/g) || []).slice(0, MAX_MENTIONS_PER_MESSAGE);
   for (const mention of userMentions) {
     const userId = mention.replace(/<@!?(\d{17,20})>/, '$1');
+    const cacheKey = `user:${userId}:${guild.id}`;
+    if (mentionCache.has(cacheKey)) {
+      resolvedContent = resolvedContent.replace(mention, mentionCache.get(cacheKey).value);
+      continue;
+    }
     try {
       const member = await guild.members.fetch(userId).catch(() => null);
-      if (member) resolvedContent = resolvedContent.replace(mention, `@${member.user.username}`);
+      if (member) {
+        const resolved = `@${member.user.username}`;
+        mentionCache.set(cacheKey, { value: resolved, timestamp: Date.now() });
+        resolvedContent = resolvedContent.replace(mention, resolved);
+      }
     } catch {}
   }
-  const roleMentions = content.match(/<@&(\d{17,20})>/g) || [];
+  const roleMentions = (content.match(/<@&(\d{17,20})>/g) || []).slice(0, MAX_MENTIONS_PER_MESSAGE);
   for (const mention of roleMentions) {
     const roleId = mention.replace(/<@&(\d{17,20})>/, '$1');
+    const cacheKey = `role:${roleId}:${guild.id}`;
+    if (mentionCache.has(cacheKey)) {
+      resolvedContent = resolvedContent.replace(mention, mentionCache.get(cacheKey).value);
+      continue;
+    }
     try {
       const role = await guild.roles.fetch(roleId);
-      if (role) resolvedContent = resolvedContent.replace(mention, `@${role.name}`);
+      if (role) {
+        const resolved = `@${role.name}`;
+        mentionCache.set(cacheKey, { value: resolved, timestamp: Date.now() });
+        resolvedContent = resolvedContent.replace(mention, resolved);
+      }
     } catch {}
   }
-  const channelMentions = content.match(/<#(\d{17,20})>/g) || [];
+  const channelMentions = (content.match(/<#(\d{17,20})>/g) || []).slice(0, MAX_MENTIONS_PER_MESSAGE);
   for (const mention of channelMentions) {
     const channelId = mention.replace(/<#(\d{17,20})>/, '$1');
+    const cacheKey = `channel:${channelId}:${guild.id}`;
+    if (mentionCache.has(cacheKey)) {
+      resolvedContent = resolvedContent.replace(mention, mentionCache.get(cacheKey).value);
+      continue;
+    }
     try {
       const channel = await guild.channels.fetch(channelId);
-      if (channel) resolvedContent = resolvedContent.replace(mention, `#${channel.name}`);
+      if (channel) {
+        const resolved = `#${channel.name}`;
+        mentionCache.set(cacheKey, { value: resolved, timestamp: Date.now() });
+        resolvedContent = resolvedContent.replace(mention, resolved);
+      }
     } catch {}
   }
   resolvedContent = resolvedContent.replace(/@(everyone|here)/g, '@\u200b$1');
   return resolvedContent;
 };
-
 const sendMessageToChannel = async (channelId, content, options = {}) => {
   try {
     const channel = await client.channels.fetch(channelId).catch(() => null);
@@ -187,48 +220,56 @@ const sendMessageToChannel = async (channelId, content, options = {}) => {
     return null;
   }
 };
-
 const processMessageQueue = async (channelId) => {
   if (!messageQueue.has(channelId) || messageQueue.get(channelId).length === 0) return;
   const queue = messageQueue.get(channelId);
-  const messageData = queue[0];
-  try {
-    const sentMessage = await sendMessageToChannel(channelId, messageData.content, {
-      username: messageData.username,
-      avatarURL: messageData.avatarURL,
-      files: messageData.files,
-      content: messageData.processedContent
-    });
-    if (sentMessage && messageData.originalId) {
-      relayMap.set(sentMessage.id, {
-        originalId: messageData.originalId,
-        originalChannelId: messageData.originalChannelId,
-        timestamp: Date.now()
+  const batch = queue.splice(0, Math.min(MAX_CONCURRENT_MESSAGES, queue.length));
+  const promises = batch.map(async messageData => {
+    try {
+      const sentMessage = await sendMessageToChannel(channelId, messageData.content, {
+        username: messageData.username,
+        avatarURL: messageData.avatarURL,
+        files: messageData.files,
+        content: messageData.processedContent
       });
+      if (sentMessage && messageData.originalId) {
+        relayMap.set(sentMessage.id, {
+          originalId: messageData.originalId,
+          originalChannelId: messageData.originalChannelId,
+          timestamp: Date.now()
+        });
+      }
+    } catch (error) {
+      logger.error(`Erreur file ${channelId}`, error);
+      stats.increment('errors');
     }
-    queue.shift();
-  } catch (error) {
-    logger.error(`Erreur file ${channelId}`, error);
-    stats.increment('errors');
-    queue.shift();
+  });
+  await Promise.all(promises);
+  if (queue.length > 0) {
+    const dynamicDelay = Math.max(PROCESSING_DELAY, queue.length * 50);
+    setTimeout(() => processMessageQueue(channelId), dynamicDelay);
+  } else {
+    messageQueue.delete(channelId);
   }
-  if (queue.length > 0) setTimeout(() => processMessageQueue(channelId), PROCESSING_DELAY);
-  else messageQueue.delete(channelId);
 };
-
 const addToQueue = (channelId, messageData) => {
   if (!messageQueue.has(channelId)) messageQueue.set(channelId, []);
   messageQueue.get(channelId).push(messageData);
   if (messageQueue.get(channelId).length === 1) processMessageQueue(channelId);
 };
-
 const getWebhook = async channel => {
   if (webhookCache.has(channel.id)) {
     const cached = webhookCache.get(channel.id);
     cached.timestamp = Date.now();
     return cached.webhook;
   }
-  if (!channel.permissionsFor(client.user).has(PermissionsBitField.Flags.ManageWebhooks)) return null;
+  if (permissionCache.has(channel.id)) {
+    return null;
+  }
+  if (!channel.permissionsFor(client.user).has(PermissionsBitField.Flags.ManageWebhooks)) {
+    permissionCache.set(channel.id, { timestamp: Date.now() });
+    return null;
+  }
   try {
     const webhooks = await channel.fetchWebhooks();
     let webhook = webhooks.find(w => w.owner.id === client.user.id);
@@ -245,7 +286,6 @@ const getWebhook = async channel => {
     return null;
   }
 };
-
 const loadData = async () => {
   connectedChannels.clear();
   const guilds = db.prepare('SELECT * FROM guilds').all();
@@ -254,16 +294,22 @@ const loadData = async () => {
   }
   logger.database('Données chargées depuis SQLite');
 };
-
 const saveData = async (immediate = false) => {
   if (saveData.timeout && !immediate) clearTimeout(saveData.timeout);
   const performSave = async () => {
     try {
       const transaction = db.transaction(() => {
-        db.prepare('DELETE FROM guilds').run();
-        const insertGuild = db.prepare('INSERT OR REPLACE INTO guilds (guild_id, channel_id) VALUES (?, ?)');
+        const insertOrUpdate = db.prepare('INSERT OR REPLACE INTO guilds (guild_id, channel_id) VALUES (?, ?)');
+        const deleteGuild = db.prepare('DELETE FROM guilds WHERE guild_id = ?');
+        const existingGuilds = new Set(db.prepare('SELECT guild_id FROM guilds').all().map(row => row.guild_id));
         for (const [guildId, { channelId }] of connectedChannels.entries()) {
-          if (client.guilds.cache.has(guildId)) insertGuild.run(guildId, channelId);
+          if (client.guilds.cache.has(guildId)) {
+            insertOrUpdate.run(guildId, channelId);
+            existingGuilds.delete(guildId);
+          }
+        }
+        for (const guildId of existingGuilds) {
+          deleteGuild.run(guildId);
         }
       });
       transaction();
@@ -276,7 +322,6 @@ const saveData = async (immediate = false) => {
   if (immediate) await performSave();
   else saveData.timeout = setTimeout(performSave, 1000);
 };
-
 const checkConnectionsHealth = async () => {
   logger.info('Vérification santé connexions...');
   let cleanedCount = 0;
@@ -293,20 +338,28 @@ const checkConnectionsHealth = async () => {
   if (cleanedCount > 0) await saveData(true);
   logger.success('Vérification terminée');
 };
-
-setInterval(() => {
+const cleanupCache = (cache, ttl, maxSize) => {
   const now = Date.now();
-  for (const [id, { timestamp }] of relayMap) if (now - timestamp > RELAY_MAP_TTL) relayMap.delete(id);
-  for (const [channelId, { timestamp }] of webhookCache) if (now - timestamp > WEBHOOK_CACHE_TTL) webhookCache.delete(channelId);
-  for (const [guildId, { timestamp }] of connectedChannels) if (now - timestamp > CONNECTED_CHANNELS_TTL) connectedChannels.delete(guildId);
+  let size = cache.size;
+  for (const [key, data] of cache) {
+    const timestamp = data.timestamp || 0;
+    if (now - timestamp > ttl || size > maxSize) {
+      cache.delete(key);
+      size--;
+    }
+  }
+};
+setInterval(() => {
+  cleanupCache(relayMap, RELAY_MAP_TTL, MAX_CACHE_SIZE);
+  cleanupCache(webhookCache, WEBHOOK_CACHE_TTL, MAX_CACHE_SIZE);
+  cleanupCache(connectedChannels, CONNECTED_CHANNELS_TTL, MAX_CACHE_SIZE);
+  cleanupCache(mentionCache, MENTION_CACHE_TTL, MAX_CACHE_SIZE);
+  cleanupCache(permissionCache, WEBHOOK_CACHE_TTL, MAX_CACHE_SIZE);
 }, 60 * 60 * 1000);
-
 setInterval(() => saveData(), SAVE_INTERVAL);
 setInterval(checkConnectionsHealth, HEALTH_CHECK_INTERVAL);
 setInterval(() => stats.printStats(), 60 * 60 * 1000);
-
 const updateActivity = () => client.user.setActivity(`Je suis sur ${client.guilds.cache.size} serveurs`, { type: ActivityType.Custom });
-
 const commands = [
   new SlashCommandBuilder()
     .setName('interserveur')
@@ -316,19 +369,41 @@ const commands = [
     .addSubcommand(subcommand => subcommand.setName('statut').setDescription('Vérifier le statut du réseau'))
     .addSubcommand(subcommand => subcommand.setName('diagnostic').setDescription('Afficher les statistiques du bot'))
 ].map(cmd => cmd.toJSON());
-
 client.on('guildCreate', guild => {
   logger.success(`Nouveau serveur: ${guild.name}`);
   updateActivity();
 });
-
 client.on('guildDelete', guild => {
   logger.warn(`Serveur quitté: ${guild.name}`);
-  connectedChannels.delete(guild.id);
-  saveData();
+  try {
+    // Supprimer les données de la base de données
+    const deleteGuild = db.prepare('DELETE FROM guilds WHERE guild_id = ?');
+    deleteGuild.run(guild.id);
+    logger.database(`Données supprimées pour le serveur ${guild.name} (ID: ${guild.id})`);
+
+    // Nettoyer les caches associés
+    connectedChannels.delete(guild.id);
+    for (const [key] of relayMap) {
+      if (key.includes(guild.id)) relayMap.delete(key);
+    }
+    for (const [key] of webhookCache) {
+      if (key.includes(guild.id)) webhookCache.delete(key);
+    }
+    for (const [key] of mentionCache) {
+      if (key.includes(guild.id)) mentionCache.delete(key);
+    }
+    for (const [key] of permissionCache) {
+      if (key.includes(guild.id)) permissionCache.delete(key);
+    }
+    for (const [key] of messageQueue) {
+      if (key.includes(guild.id)) messageQueue.delete(key);
+    }
+  } catch (error) {
+    logger.error(`Erreur lors de la suppression des données pour le serveur ${guild.id}`, error);
+    stats.increment('errors');
+  }
   updateActivity();
 });
-
 client.on('clientReady', async () => {
   console.log(green('🚀 Bot démarré !'));
   await loadData();
@@ -338,33 +413,36 @@ client.on('clientReady', async () => {
   logger.success('Commandes enregistrées');
   stats.printStats();
 });
-
 client.on('interactionCreate', async interaction => {
   if (!interaction.isChatInputCommand() || interaction.commandName !== 'interserveur') return;
   stats.increment('commandsExecuted');
-  await interaction.deferReply({ flags: [MessageFlags.Ephemeral] });
+  await interaction.deferReply({ ephemeral: true });
   const subcommand = interaction.options.getSubcommand();
   const guildId = interaction.guildId;
   const channelId = interaction.channelId;
   const guildData = connectedChannels.get(guildId);
-
-  // Vérifier si la commande (sauf config) est exécutée dans le salon configuré
   if (subcommand !== 'config' && guildData && channelId !== guildData.channelId) {
     return interaction.editReply({ content: LANGUAGES.fr.wrong_channel });
   }
-
   if (subcommand === 'config') {
     connectedChannels.set(guildId, { channelId, timestamp: Date.now() });
     await saveData();
     return interaction.editReply({ content: LANGUAGES.fr.connected.replace('{channel}', interaction.channel.name) });
   } else if (subcommand === 'statut') {
     if (!guildData) return interaction.editReply({ content: LANGUAGES.fr.unconfigured });
+    const botPing = client.ws.ping !== -1 ? `${client.ws.ping}ms` : 'Inconnu';
+    const apiPing = Date.now() - interaction.createdTimestamp;
+    const dbLatency = measureDbLatency();
     const embed = new EmbedBuilder()
       .setTitle('📊 Statut Réseau')
       .setColor('#00AAFF')
       .addFields(
-        { name: '🔄 Salon', value: `<#${guildData.channelId}>`, inline: true },
-        { name: '🏠 Serveurs Connectés', value: `${connectedChannels.size}`, inline: true }
+        { name: '🔄 Salon', value: `<#${guildData.channelId}>`, inline: false },
+        { name: '🏠 Serveurs Connectés', value: `${connectedChannels.size}`, inline: false },
+        { name: '\u200b', value: '──────────────────────────────', inline: false },
+        { name: '📡 Ping Bot (WebSocket)', value: botPing, inline: false },
+        { name: '🌐 Ping API Discord', value: `${apiPing}ms`, inline: false },
+        { name: '💾 Latence Base de Données', value: dbLatency !== -1 ? `${dbLatency}ms` : 'Inconnu', inline: false }
       );
     return interaction.editReply({ embeds: [embed] });
   } else if (subcommand === 'diagnostic') {
@@ -373,24 +451,26 @@ client.on('interactionCreate', async interaction => {
       .setTitle('📊 STATISTIQUES DU BOT INTERSERVEUR')
       .setColor('#00AAFF')
       .addFields(
-        { name: '🕒 Uptime', value: summary.uptime, inline: true },
-        { name: '🏠 Serveurs', value: `${summary.servers}`, inline: true },
-        { name: '🔗 Canaux connectés', value: `${summary.connectedChannels}`, inline: true },
-        { name: '📨 Messages envoyés', value: `${summary.messagesSent}`, inline: true },
-        { name: '📩 Messages reçus', value: `${summary.messagesReceived}`, inline: true },
-        { name: '⚡ Commandes exécutées', value: `${summary.commandsExecuted}`, inline: true },
-        { name: '🪝 Webhooks créés', value: `${summary.webhooksCreated}`, inline: true },
-        { name: '🗺️ Relay Map', value: `${summary.relayMapSize}`, inline: true },
-        { name: '💾 Webhook Cache', value: `${summary.webhookCacheSize}`, inline: true },
-        { name: '📋 Files d\'attente', value: `${summary.messageQueues}`, inline: true },
-        { name: '❌ Erreurs', value: summary.errors > 0 ? `**${summary.errors}**` : '0', inline: true },
-        { name: '💾 Mémoire', value: summary.memoryUsage, inline: true }
+        { name: '🕒 Uptime', value: summary.uptime, inline: false },
+        { name: '🏠 Serveurs', value: `${summary.servers}`, inline: false },
+        { name: '🔗 Canaux connectés', value: `${summary.connectedChannels}`, inline: false },
+        { name: '\u200b', value: '──────────────────────────────', inline: false },
+        { name: '📨 Messages envoyés', value: `${summary.messagesSent}`, inline: false },
+        { name: '📩 Messages reçus', value: `${summary.messagesReceived}`, inline: false },
+        { name: '⚡ Commandes exécutées', value: `${summary.commandsExecuted}`, inline: false },
+        { name: '\u200b', value: '──────────────────────────────', inline: false },
+        { name: '🪝 Webhooks créés', value: `${summary.webhooksCreated}`, inline: false },
+        { name: '🗺️ Relay Map', value: `${summary.relayMapSize}`, inline: false },
+        { name: '💾 Webhook Cache', value: `${summary.webhookCacheSize}`, inline: false },
+        { name: '📋 Files d\'attente', value: `${summary.messageQueues}`, inline: false },
+        { name: '\u200b', value: '──────────────────────────────', inline: false },
+        { name: '❌ Erreurs', value: summary.errors > 0 ? `**${summary.errors}**` : '0', inline: false },
+        { name: '💾 Mémoire', value: summary.memoryUsage, inline: false }
       )
       .setTimestamp();
     return interaction.editReply({ embeds: [embed] });
   }
 });
-
 client.on('messageCreate', async message => {
   if (message.author.bot) return;
   stats.increment('messagesReceived');
@@ -424,7 +504,6 @@ client.on('messageCreate', async message => {
     }
   }
 });
-
 const handleExit = signal => {
   logger.system(`Arrêt (${signal})`);
   saveData(true);
@@ -434,5 +513,4 @@ const handleExit = signal => {
 };
 process.on('SIGINT', () => handleExit('SIGINT'));
 process.on('SIGTERM', () => handleExit('SIGTERM'));
-
 client.login(process.env.DISCORD_TOKEN);
