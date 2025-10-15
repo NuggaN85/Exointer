@@ -40,11 +40,9 @@ CLIENT_ID=VOTRE_CLIENT_ID
 
 Le bot utilise des commandes slash pour interagir avec les utilisateurs. Voici les commandes disponibles :
 
-- `/interserveur generer` : Génère une nouvelle fréquence pour un inter-serveur.
-- `/interserveur lier <frequence>` : Lie le canal actuel à une fréquence existante.
-- `/interserveur gerer` : Affiche la fréquence du canal actuel.
-- `/listefrequences` : Affiche la liste des serveurs ayant généré une fréquence.
-- `/interserveur delier` : Délie le canal actuel de sa fréquence.
+- **`/interserveur config`** - Connecte le salon actuel au réseau
+- **`/interserveur deconfig`** - Déconnecte le salon
+- **`/interserveur stats`** - Affiche les statistiques du réseau
 
 ## Utilisation
 
