@@ -19,22 +19,18 @@
     "audit": "npm audit --audit-level=moderate",
     "fix": "npm audit fix --force",
     "clean": "rm -rf node_modules package-lock.json && npm install",
-    "check": "npm outdated",
-    "lint": "eslint .",
-    "format": "prettier --write ."
+    "check": "npm outdated"
   },
   "dependencies": {
-    "better-sqlite3": "^12.2.0",
-    "discord.js": "^14.22.1",
-    "dotenv": "^17.2.1"
+    "better-sqlite3": "^12.4.1",
+    "discord.js": "^14.23.2",
+    "dotenv": "^17.2.3",
+    "kleur": "^4.1.5"
   },
   "devDependencies": {
-    "kleur": "^4.1.5",
     "nodemon": "^3.1.10",
-    "npm-check-updates": "^18.0.1",
-    "npm-run-all": "^4.1.5",
-    "eslint": "^9.27.0",
-    "prettier": "^3.5.3"
+    "npm-check-updates": "^19.0.0",
+    "npm-run-all": "^4.1.5"
   },
   "author": "EXOBOT",
   "license": "MIT"
