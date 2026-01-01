@@ -1,1 +1,1 @@
-echo "14.19.3" > .nvmrc
+echo "14.25.1" > .nvmrc
