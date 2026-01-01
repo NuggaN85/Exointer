@@ -1,7 +1,7 @@
 {
   "name": "EXOINTER",
   "version": "1.0.7",
-  "description": "Je suis votre assistant assistant qui facilite la communication inter-serveurs.",
+  "description": "Je suis votre assistant qui facilite la communication inter-serveurs.",
   "homepage": "https://rl-informatique.fr",
   "private": true,
   "type": "module",
