@@ -589,7 +589,6 @@ client.on(Events.MessageReactionRemove, async (reaction, user) => {
 });
 
 // ─── Fermeture propre ─────────────────────────────────────────────────────────
-
 const handleExit = (signal) => {
   try {
     console.log(`\n${signal} reçu, fermeture en cours...`);
@@ -608,7 +607,6 @@ const handleExit = (signal) => {
 process.on('SIGINT',  () => handleExit('SIGINT'));
 process.on('SIGTERM', () => handleExit('SIGTERM'));
 
-// FIX 9 : Ne plus tuer le bot sur toute erreur non gérée — juste logger
 process.on('uncaughtException', (err) => {
   console.error('❌ Erreur non capturée:', err);
 });
@@ -618,7 +616,6 @@ process.on('unhandledRejection', (err) => {
 });
 
 // ─── Connexion ────────────────────────────────────────────────────────────────
-
 client.login(process.env.DISCORD_TOKEN).catch((err) => {
   console.error('❌ Erreur de connexion Discord:', err.message);
   process.exit(1);
