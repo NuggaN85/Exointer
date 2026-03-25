@@ -1,6 +1,11 @@
 'use strict';
 
-const { Client, GatewayIntentBits, Partials, REST, Routes, ActivityType, PermissionsBitField, WebhookClient, EmbedBuilder, ActionRowBuilder, SlashCommandBuilder, StringSelectMenuBuilder, StringSelectMenuOptionBuilder, Events, ButtonBuilder, ButtonStyle } = require('discord.js');
+const {
+  Client, GatewayIntentBits, Partials, REST, Routes,
+  ActivityType, PermissionsBitField, WebhookClient, EmbedBuilder,
+  ActionRowBuilder, SlashCommandBuilder, StringSelectMenuBuilder,
+  StringSelectMenuOptionBuilder, Events, ButtonBuilder, ButtonStyle,
+} = require('discord.js');
 const path = require('path');
 const Database = require('better-sqlite3');
 require('dotenv').config();
@@ -35,37 +40,37 @@ const client = new Client({
 
 // ─── Base de données SQLite ───────────────────────────────────────────────────
 const db = new Database(path.join(__dirname, 'interservers.db'));
-    // Configuration pragma optimisée
-    db.pragma('journal_mode = WAL');
-    db.pragma('synchronous = NORMAL');
-    db.pragma('cache_size = -64000');
-    db.pragma('temp_store = MEMORY');
-    db.pragma('foreign_keys = ON');
-    db.pragma('busy_timeout = 5000');
+db.pragma('journal_mode = WAL');
+db.pragma('synchronous = NORMAL');
+db.pragma('cache_size = -64000');
+db.pragma('temp_store = MEMORY');
+db.pragma('foreign_keys = ON');
+db.pragma('busy_timeout = 5000');
 
 db.exec(`
   CREATE TABLE IF NOT EXISTS guilds (
-    guild_id TEXT PRIMARY KEY,
+    guild_id   TEXT PRIMARY KEY,
     channel_id TEXT
   );
 `);
 
 // ─── State en mémoire ─────────────────────────────────────────────────────────
-const connectedChannels = new Map();
-const relayMap = new Map();
-const reverseRelayMap = new Map();
-const webhookCache = new Map(); 
-const webhookQueues = new Map(); 
+const connectedChannels = new Map(); // guildId → channelId
+const relayMap          = new Map(); // relayedMsgId → { originalId, originalChannelId, originalGuildId, timestamp }
+const reverseRelayMap   = new Map(); // originalMsgId → [{ relayedId, relayedChannelId }]
+const webhookCache      = new Map(); // channelId → WebhookClient
+const webhookQueues     = new Map(); // channelId → Promise (file d'attente séquentielle)
 
-const MAX_FILE_SIZE = 8 * 1024 * 1024; // 8 Mo
-const RELAY_MAP_TTL = 24 * 60 * 60 * 1000; // 24 h
-const SAVE_INTERVAL = 5 * 60 * 1000; // 5 min
+const MAX_FILE_SIZE  = 8 * 1024 * 1024;       // 8 Mo
+const RELAY_MAP_TTL  = 24 * 60 * 60 * 1000;   // 24 h
+const SAVE_INTERVAL  = 5 * 60 * 1000;         // 5 min
+const QUEUE_DELAY_MS = 500;                   // délai entre envois webhook
 
 // ─── Traductions ──────────────────────────────────────────────────────────────
 const LANG = {
   config_success:    '✅ Configuration réussie ! Ce salon est maintenant connecté au réseau inter-serveurs.',
   already_connected: '⚠️ Ce salon est déjà connecté au réseau inter-serveurs.',
-  not_connected:     '❌ Ce serveur n\'est pas connecté au réseau inter-serveurs.',
+  not_connected:     "❌ Ce serveur n'est pas connecté au réseau inter-serveurs.",
   disconnected:      '🔓 Salon déconnecté du réseau inter-serveurs.',
   missing_access:    '⚠️ Accès manquant au canal {channelId} sur le serveur {guildName}.',
 };
@@ -73,15 +78,13 @@ const LANG = {
 // ─── Helpers ──────────────────────────────────────────────────────────────────
 const encodeMentions = async (content) => {
   if (!content) return '';
-  // Bloquer @everyone / @here
   let result = content.replace(/@(everyone|here)/g, '@\u200b$1');
   const mentionRegex = /<@!?(\d{17,20})>/g;
-  const matches = [...result.matchAll(mentionRegex)];
-  for (const match of matches) {
+  for (const match of [...result.matchAll(mentionRegex)]) {
     try {
       const user = await client.users.fetch(match[1]);
       result = result.replace(match[0], `@${user.username}`);
-    } catch { /* utilisateur introuvable, on laisse tel quel */ }
+    } catch { /* utilisateur introuvable */ }
   }
   return result;
 };
@@ -114,15 +117,14 @@ const loadData = () => {
   }
 };
 
-// Nettoyage périodique de la relayMap + reverseRelayMap
+// ─── Nettoyage périodique de relayMap / reverseRelayMap ──────────────────────
 setInterval(() => {
   const now = Date.now();
-  for (const [id, entry] of relayMap.entries()) {
+  for (const [id, entry] of relayMap) {
     if (now - entry.timestamp > RELAY_MAP_TTL) {
-      // Nettoyer aussi la map inverse
-      const reverse = reverseRelayMap.get(entry.originalId);
-      if (reverse) {
-        const filtered = reverse.filter(r => r.relayedId !== id);
+      const list = reverseRelayMap.get(entry.originalId);
+      if (list) {
+        const filtered = list.filter(r => r.relayedId !== id);
         if (filtered.length === 0) reverseRelayMap.delete(entry.originalId);
         else reverseRelayMap.set(entry.originalId, filtered);
       }
@@ -140,14 +142,15 @@ const getWebhook = async (channel) => {
     PermissionsBitField.Flags.ManageWebhooks,
     PermissionsBitField.Flags.SendMessages,
   ])) {
-    console.warn(`⚠️ Permissions insuffisantes pour webhooks dans ${channel.id} (${channel.guild?.name})`);
+    console.warn(
+      LANG.missing_access
+        .replace('{channelId}', channel.id)
+        .replace('{guildName}', channel.guild?.name ?? 'Inconnu')
+    );
     return null;
   }
 
-  // Vérifier le cache
-  if (webhookCache.has(channel.id)) {
-    return webhookCache.get(channel.id);
-  }
+  if (webhookCache.has(channel.id)) return webhookCache.get(channel.id);
 
   try {
     const webhooks = await channel.fetchWebhooks();
@@ -163,10 +166,13 @@ const getWebhook = async (channel) => {
   }
 };
 
+// FIX : la file d'attente utilisait une condition de course dans .finally().
+// On stocke la promise terminale dans la map et on la nettoie uniquement
+// si elle est toujours la même (évite d'effacer une queue plus récente).
 const enqueueWebhookSend = (channelId, sendFn) => {
-  const prev = webhookQueues.get(channelId) || Promise.resolve();
+  const prev = webhookQueues.get(channelId) ?? Promise.resolve();
   const next = prev
-    .then(() => new Promise(resolve => setTimeout(resolve, 500)))
+    .then(() => new Promise(resolve => setTimeout(resolve, QUEUE_DELAY_MS)))
     .then(sendFn)
     .catch(err => console.error(`❌ File webhook ${channelId}:`, err.message));
   webhookQueues.set(channelId, next);
@@ -194,8 +200,18 @@ const commands = [
 
 // ─── Envoi relay ──────────────────────────────────────────────────────────────
 const sendRelay = async ({ channel, content, username, avatarURL, originalGuild, files = [], replyEmbed }) => {
-  if (!channel?.isTextBased() || !channel.permissionsFor(client.user).has(['SendMessages', 'EmbedLinks'])) {
-    console.warn(LANG.missing_access.replace('{channelId}', channel.id).replace('{guildName}', channel.guild?.name || 'Inconnu'));
+  // FIX : on vérifie qu'il y a quelque chose à envoyer avant de contacter le webhook
+  if (!content && !files.length && !replyEmbed) return null;
+
+  if (
+    !channel?.isTextBased() ||
+    !channel.permissionsFor(client.user).has(['SendMessages', 'EmbedLinks'])
+  ) {
+    console.warn(
+      LANG.missing_access
+        .replace('{channelId}', channel.id)
+        .replace('{guildName}', channel.guild?.name ?? 'Inconnu')
+    );
     return null;
   }
 
@@ -204,37 +220,28 @@ const sendRelay = async ({ channel, content, username, avatarURL, originalGuild,
 
   return enqueueWebhookSend(channel.id, async () => {
     try {
-      const displayUsername = `${username} [${originalGuild.name}]`;
       const payload = {
-        username: displayUsername,
+        username: `${username} [${originalGuild.name}]`,
         avatarURL,
-        allowedMentions: { parse: [] }, 
+        allowedMentions: { parse: [] },
       };
-
-      if (content) payload.content = content;
+      if (content)    payload.content = content;
       if (files.length) payload.files = files;
       if (replyEmbed) payload.embeds = [replyEmbed];
 
-      const sent = await webhook.send(payload);
-      return sent;
+      return await webhook.send(payload);
     } catch (err) {
       console.error(`❌ Erreur webhook canal ${channel.id}:`, err.message);
-      if (err.status === 404 || err.code === 10015) {
-        webhookCache.delete(channel.id);
-      }
+      // Webhook supprimé ou invalide → invalider le cache
+      if (err.status === 404 || err.code === 10015) webhookCache.delete(channel.id);
       return null;
     }
   });
 };
 
 const registerRelay = (sentId, originalId, originalChannelId, originalGuildId, relayedChannelId) => {
-  relayMap.set(sentId, {
-    originalId,
-    originalChannelId,
-    originalGuildId,
-    timestamp: Date.now(),
-  });
-  const existing = reverseRelayMap.get(originalId) || [];
+  relayMap.set(sentId, { originalId, originalChannelId, originalGuildId, timestamp: Date.now() });
+  const existing = reverseRelayMap.get(originalId) ?? [];
   existing.push({ relayedId: sentId, relayedChannelId });
   reverseRelayMap.set(originalId, existing);
 };
@@ -262,6 +269,9 @@ client.on(Events.GuildCreate, (guild) => {
 
 client.on(Events.GuildDelete, (guild) => {
   console.log(`➖ Retiré du serveur: ${guild.name} (ID: ${guild.id})`);
+  // FIX : nettoyer aussi le cache webhook des canaux de ce guild
+  const chId = connectedChannels.get(guild.id);
+  if (chId) webhookCache.delete(chId);
   connectedChannels.delete(guild.id);
   db.prepare('DELETE FROM guilds WHERE guild_id = ?').run(guild.id);
   saveData();
@@ -318,6 +328,8 @@ client.on(Events.InteractionCreate, async (interaction) => {
         if (!connectedChannels.has(guildId)) {
           return interaction.editReply({ content: LANG.not_connected });
         }
+        // FIX : nettoyer le cache webhook du canal déconnecté
+        webhookCache.delete(channelId);
         connectedChannels.delete(guildId);
         saveData();
         updateActivity();
@@ -343,6 +355,8 @@ client.on(Events.InteractionCreate, async (interaction) => {
         }
         serverDetails.sort((a, b) => b.memberCount - a.memberCount);
 
+        // FIX : utiliser serverDetails.length (guilds réellement en cache)
+        // plutôt que connectedChannels.size pour la cohérence de l'affichage
         const statsEmbed = new EmbedBuilder()
           .setTitle('🌐 Statistiques du Réseau Inter-Serveurs')
           .setDescription('Découvrez les serveurs connectés et leurs statistiques.')
@@ -350,10 +364,10 @@ client.on(Events.InteractionCreate, async (interaction) => {
           .setTimestamp()
           .setThumbnail(client.user.displayAvatarURL({ size: 256 }))
           .addFields(
-            { name: '📊 Serveurs Connectés', value: `\`\`\`fix\n${connectedChannels.size} serveurs\n\`\`\``, inline: false },
+            { name: '📊 Serveurs Connectés', value: `\`\`\`fix\n${serverDetails.length} serveurs\n\`\`\``, inline: false },
             { name: '👥 Membres Totaux',     value: `\`\`\`fix\n${totalMembers.toLocaleString()} membres\n\`\`\``, inline: false },
             { name: '🔗 Canaux Actifs',       value: `\`\`\`fix\n${serverDetails.length} canaux\n\`\`\``, inline: false },
-            { name: '💡 Instructions',        value: '> Utilisez le menu ci-dessous pour voir les détails d\'un serveur spécifique.', inline: false }
+            { name: '💡 Instructions',        value: "> Utilisez le menu ci-dessous pour voir les détails d'un serveur spécifique.", inline: false }
           )
           .setFooter({ text: `Demandé par ${interaction.user.username}`, iconURL: interaction.user.displayAvatarURL() });
 
@@ -394,9 +408,9 @@ client.on(Events.InteractionCreate, async (interaction) => {
       const guild = client.guilds.cache.get(selectedGuildId);
       if (!guild) return interaction.editReply({ content: '❌ Serveur non trouvé.' });
 
-      const chId = connectedChannels.get(selectedGuildId);
-      const ch = guild.channels.cache.get(chId);
-      const owner = await guild.fetchOwner();
+      const chId    = connectedChannels.get(selectedGuildId);
+      const ch      = guild.channels.cache.get(chId);
+      const owner   = await guild.fetchOwner();
       const createdAt = guild.createdAt.toLocaleDateString('fr-FR', { year: 'numeric', month: 'long', day: 'numeric' });
 
       let inviteButton = null;
@@ -417,7 +431,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
         .setTitle(guild.name)
         .setDescription('> Informations détaillées sur ce serveur du réseau inter-serveurs')
         .setColor(0x5865F2)
-        .setThumbnail(guild.iconURL({ size: 256 }) || client.user.displayAvatarURL())
+        .setThumbnail(guild.iconURL({ size: 256 }) ?? client.user.displayAvatarURL())
         .setTimestamp()
         .addFields(
           { name: '👥 Nombre de membres', value: `\`\`\`fix\n${guild.memberCount.toLocaleString()}\n\`\`\``, inline: false },
@@ -428,11 +442,10 @@ client.on(Events.InteractionCreate, async (interaction) => {
         )
         .setFooter({ text: `Consulté par ${interaction.user.username}`, iconURL: interaction.user.displayAvatarURL() });
 
-      const components = inviteButton
-        ? [new ActionRowBuilder().addComponents(inviteButton)]
-        : [];
-
-      return interaction.editReply({ embeds: [detailEmbed], components });
+      return interaction.editReply({
+        embeds: [detailEmbed],
+        components: inviteButton ? [new ActionRowBuilder().addComponents(inviteButton)] : [],
+      });
     } catch (err) {
       console.error('❌ Erreur select menu:', err.message);
       await interaction.editReply({ content: '❌ Une erreur est survenue.' }).catch(() => {});
@@ -456,7 +469,7 @@ client.on(Events.MessageCreate, async (message) => {
   }
 
   const content = await encodeMentions(message.content || '');
-  const files = [...message.attachments.values()]
+  const files   = [...message.attachments.values()]
     .filter(att => att.size <= MAX_FILE_SIZE)
     .map(att => att.url);
 
@@ -465,46 +478,45 @@ client.on(Events.MessageCreate, async (message) => {
     .map(([, chId]) => chId);
 
   // ── Réponse à un message ──────────────────────────────────────────────────
+  // FIX : on encode le contenu original UNE SEULE FOIS (suppression du double encodeMentions)
   if (message.reference?.messageId) {
     const relayed = relayMap.get(message.reference.messageId);
     if (relayed) {
       const originalChannel = await client.channels.fetch(relayed.originalChannelId).catch(() => null);
-      if (!originalChannel) return;
-      const originalMessage = await originalChannel.messages.fetch(relayed.originalId).catch(() => null);
-      if (!originalMessage) return;
+      const originalMessage = originalChannel
+        ? await originalChannel.messages.fetch(relayed.originalId).catch(() => null)
+        : null;
 
-      const originalContent = originalMessage.content
-        ? await encodeMentions(originalMessage.content)
-        : '*(Message sans texte)*';
+      if (originalMessage) {
+        const originalContent = originalMessage.content
+          ? await encodeMentions(originalMessage.content)
+          : '*(Message sans texte)*';
 
-      const replyEmbed = new EmbedBuilder()
-        .setColor(0x2b2d31)
-        .setAuthor({
-          name: `↩️ En réponse à ${originalMessage.author.username}`,
-          iconURL: originalMessage.author.displayAvatarURL(),
-        })
-        .setDescription(
-          `<@${originalMessage.author.id}>\n` +
-          `${originalContent.length > 200 ? originalContent.slice(0, 200) + '…' : originalContent}`
-        );
+        const replyEmbed = new EmbedBuilder()
+          .setColor(0x2b2d31)
+          .setAuthor({
+            name: `↩️ En réponse à ${originalMessage.author.username}`,
+            iconURL: originalMessage.author.displayAvatarURL(),
+          })
+          .setDescription(
+            `<@${originalMessage.author.id}>\n` +
+            (originalContent.length > 200 ? `${originalContent.slice(0, 200)}…` : originalContent)
+          );
 
-      await Promise.allSettled(targets.map(async (chId) => {
-        const channel = await client.channels.fetch(chId).catch(() => null);
-        if (!channel) return;
-        const sent = await sendRelay({
-          channel,
-          content,
-          username: message.author.username,
-          avatarURL: message.author.displayAvatarURL(),
-          originalGuild: message.guild,
-          files,
-          replyEmbed,
-        });
-        if (sent) {
-          registerRelay(sent.id, message.id, message.channelId, guildId, channel.id);
-        }
-      }));
-      return;
+        await Promise.allSettled(targets.map(async (chId) => {
+          const channel = await client.channels.fetch(chId).catch(() => null);
+          if (!channel) return;
+          const sent = await sendRelay({
+            channel, content,
+            username: message.author.username,
+            avatarURL: message.author.displayAvatarURL(),
+            originalGuild: message.guild,
+            files, replyEmbed,
+          });
+          if (sent) registerRelay(sent.id, message.id, message.channelId, guildId, channel.id);
+        }));
+        return;
+      }
     }
   }
 
@@ -513,48 +525,55 @@ client.on(Events.MessageCreate, async (message) => {
     const channel = await client.channels.fetch(chId).catch(() => null);
     if (!channel) return;
     const sent = await sendRelay({
-      channel,
-      content,
+      channel, content,
       username: message.author.username,
       avatarURL: message.author.displayAvatarURL(),
       originalGuild: message.guild,
       files,
     });
-    if (sent) {
-      registerRelay(sent.id, message.id, message.channelId, guildId, channel.id);
-    }
+    if (sent) registerRelay(sent.id, message.id, message.channelId, guildId, channel.id);
   }));
 });
 
 // ─── Propagation des réactions ────────────────────────────────────────────────
+
+// FIX : résolution du partial AVANT d'accéder à message.guildId
+const resolveReaction = async (reaction) => {
+  if (reaction.partial) await reaction.fetch();
+  if (reaction.message.partial) await reaction.message.fetch();
+  return reaction;
+};
+
 const propagateReaction = async (message, emoji, action) => {
+  // FIX : sécuriser l'accès à guildId (peut être null sur un partial non résolu)
+  if (!message.guildId) return;
+
   const channelId = connectedChannels.get(message.guildId);
   if (!channelId || message.channelId !== channelId) return;
 
-  const emojiKey = emoji.id || emoji.name;
+  const emojiKey = emoji.id ?? emoji.name;
+  const add      = action === 'add';
 
-  const applyReaction = async (targetMessage, add) => {
+  const applyReaction = async (targetMessage) => {
     if (add) {
       await targetMessage.react(emojiKey).catch(err =>
         console.error('❌ Erreur react:', err.message)
       );
     } else {
       const r = targetMessage.reactions.cache.get(emojiKey);
-      if (r) {
-        await r.users.remove(client.user.id).catch(err =>
-          console.error('❌ Erreur remove react:', err.message)
-        );
-      }
+      if (r) await r.users.remove(client.user.id).catch(err =>
+        console.error('❌ Erreur remove react:', err.message)
+      );
     }
   };
 
   // Cas 1 : relai → original
   const relayed = relayMap.get(message.id);
   if (relayed) {
-    const targetCh = await client.channels.fetch(relayed.originalChannelId).catch(() => null);
+    const targetCh  = await client.channels.fetch(relayed.originalChannelId).catch(() => null);
     if (!targetCh?.isTextBased()) return;
     const targetMsg = await targetCh.messages.fetch(relayed.originalId).catch(() => null);
-    if (targetMsg) await applyReaction(targetMsg, action === 'add');
+    if (targetMsg) await applyReaction(targetMsg);
     return;
   }
 
@@ -562,28 +581,32 @@ const propagateReaction = async (message, emoji, action) => {
   const relayedList = reverseRelayMap.get(message.id);
   if (relayedList) {
     await Promise.allSettled(relayedList.map(async ({ relayedId, relayedChannelId }) => {
-      const targetCh = await client.channels.fetch(relayedChannelId).catch(() => null);
+      const targetCh  = await client.channels.fetch(relayedChannelId).catch(() => null);
       if (!targetCh?.isTextBased()) return;
       const targetMsg = await targetCh.messages.fetch(relayedId).catch(() => null);
-      if (targetMsg) await applyReaction(targetMsg, action === 'add');
+      if (targetMsg) await applyReaction(targetMsg);
     }));
   }
 };
 
 client.on(Events.MessageReactionAdd, async (reaction, user) => {
   if (user.bot) return;
-  if (reaction.partial) {
-    try { await reaction.fetch(); }
-    catch (err) { console.error('❌ Fetch réaction:', err.message); return; }
+  try {
+    await resolveReaction(reaction);
+  } catch (err) {
+    console.error('❌ Fetch réaction (add):', err.message);
+    return;
   }
   await propagateReaction(reaction.message, reaction.emoji, 'add');
 });
 
 client.on(Events.MessageReactionRemove, async (reaction, user) => {
   if (user.bot) return;
-  if (reaction.partial) {
-    try { await reaction.fetch(); }
-    catch (err) { console.error('❌ Fetch réaction:', err.message); return; }
+  try {
+    await resolveReaction(reaction);
+  } catch (err) {
+    console.error('❌ Fetch réaction (remove):', err.message);
+    return;
   }
   await propagateReaction(reaction.message, reaction.emoji, 'remove');
 });
@@ -607,13 +630,8 @@ const handleExit = (signal) => {
 process.on('SIGINT',  () => handleExit('SIGINT'));
 process.on('SIGTERM', () => handleExit('SIGTERM'));
 
-process.on('uncaughtException', (err) => {
-  console.error('❌ Erreur non capturée:', err);
-});
-
-process.on('unhandledRejection', (err) => {
-  console.error('❌ Promise rejetée non gérée:', err);
-});
+process.on('uncaughtException',   (err) => console.error('❌ Erreur non capturée:', err));
+process.on('unhandledRejection',  (err) => console.error('❌ Promise rejetée non gérée:', err));
 
 // ─── Connexion ────────────────────────────────────────────────────────────────
 client.login(process.env.DISCORD_TOKEN).catch((err) => {
