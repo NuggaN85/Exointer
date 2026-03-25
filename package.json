@@ -5,31 +5,21 @@
   "homepage": "https://rl-informatique.fr",
   "private": true,
   "type": "module",
-  "engines": {
-    "node": ">=24.x",
-    "npm": ">=11.x"
-  },
   "scripts": {
     "start": "node src/bot.js",
     "dev": "nodemon src/bot.js",
-    "prod": "NODE_ENV=production node src/bot.js",
-    "update": "npm-run-all -s update:deps audit fix",
-    "update:deps": "npx npm-check-updates -u && npm install",
-    "update:interactive": "npx npm-check-updates -i",
-    "audit": "npm audit --audit-level=moderate",
-    "fix": "npm audit fix --force",
     "clean": "rm -rf node_modules package-lock.json && npm install",
     "check": "npm outdated"
   },
   "dependencies": {
-    "better-sqlite3": "^12.5.0",
+    "better-sqlite3": "^12.8.0",
     "discord.js": "^14.25.1",
-    "dotenv": "^17.2.3",
+    "dotenv": "^17.3.1",
     "kleur": "^4.1.5"
   },
   "devDependencies": {
-    "nodemon": "^3.1.10",
-    "npm-check-updates": "^19.1.2",
+    "nodemon": "^3.1.14",
+    "npm-check-updates": "^19.6.5",
     "npm-run-all": "^4.1.5"
   },
   "author": "EXOBOT",
