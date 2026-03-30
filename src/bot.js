@@ -166,9 +166,6 @@ const getWebhook = async (channel) => {
   }
 };
 
-// FIX : la file d'attente utilisait une condition de course dans .finally().
-// On stocke la promise terminale dans la map et on la nettoie uniquement
-// si elle est toujours la même (évite d'effacer une queue plus récente).
 const enqueueWebhookSend = (channelId, sendFn) => {
   const prev = webhookQueues.get(channelId) ?? Promise.resolve();
   const next = prev
@@ -200,7 +197,6 @@ const commands = [
 
 // ─── Envoi relay ──────────────────────────────────────────────────────────────
 const sendRelay = async ({ channel, content, username, avatarURL, originalGuild, files = [], replyEmbed }) => {
-  // FIX : on vérifie qu'il y a quelque chose à envoyer avant de contacter le webhook
   if (!content && !files.length && !replyEmbed) return null;
 
   if (
@@ -255,10 +251,31 @@ client.once(Events.ClientReady, async (readyClient) => {
 
   const rest = new REST({ version: '10' }).setToken(process.env.DISCORD_TOKEN);
   try {
-    await rest.put(Routes.applicationCommands(process.env.CLIENT_ID), { body: commands });
+    const clientId = process.env.CLIENT_ID;
+    if (!clientId) {
+      throw new Error('CLIENT_ID non défini dans le fichier .env');
+    }
+    
+    console.log(`🔄 Enregistrement des commandes pour l'application ${clientId}...`);
+
+    await rest.put(Routes.applicationCommands(clientId), { body: commands });
     console.log('✅ Commandes slash enregistrées globalement');
   } catch (err) {
     console.error('❌ Erreur enregistrement commandes:', err);
+    if (err.code === 403 || err.code === 20012) {
+      console.log('🔄 Tentative d\'enregistrement des commandes par serveur...');
+      for (const guild of client.guilds.cache.values()) {
+        try {
+          await rest.put(
+            Routes.applicationGuildCommands(clientId, guild.id),
+            { body: commands }
+          );
+          console.log(`✅ Commandes enregistrées pour le serveur: ${guild.name} (${guild.id})`);
+        } catch (guildErr) {
+          console.error(`❌ Erreur pour le serveur ${guild.name}:`, guildErr.message);
+        }
+      }
+    }
   }
 });
 
@@ -269,7 +286,6 @@ client.on(Events.GuildCreate, (guild) => {
 
 client.on(Events.GuildDelete, (guild) => {
   console.log(`➖ Retiré du serveur: ${guild.name} (ID: ${guild.id})`);
-  // FIX : nettoyer aussi le cache webhook des canaux de ce guild
   const chId = connectedChannels.get(guild.id);
   if (chId) webhookCache.delete(chId);
   connectedChannels.delete(guild.id);
@@ -328,7 +344,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
         if (!connectedChannels.has(guildId)) {
           return interaction.editReply({ content: LANG.not_connected });
         }
-        // FIX : nettoyer le cache webhook du canal déconnecté
+
         webhookCache.delete(channelId);
         connectedChannels.delete(guildId);
         saveData();
@@ -355,8 +371,6 @@ client.on(Events.InteractionCreate, async (interaction) => {
         }
         serverDetails.sort((a, b) => b.memberCount - a.memberCount);
 
-        // FIX : utiliser serverDetails.length (guilds réellement en cache)
-        // plutôt que connectedChannels.size pour la cohérence de l'affichage
         const statsEmbed = new EmbedBuilder()
           .setTitle('🌐 Statistiques du Réseau Inter-Serveurs')
           .setDescription('Découvrez les serveurs connectés et leurs statistiques.')
@@ -454,7 +468,6 @@ client.on(Events.InteractionCreate, async (interaction) => {
 });
 
 // ─── Relai des messages ───────────────────────────────────────────────────────
-
 client.on(Events.MessageCreate, async (message) => {
   if (message.author.bot || !message.guild) return;
 
@@ -478,7 +491,6 @@ client.on(Events.MessageCreate, async (message) => {
     .map(([, chId]) => chId);
 
   // ── Réponse à un message ──────────────────────────────────────────────────
-  // FIX : on encode le contenu original UNE SEULE FOIS (suppression du double encodeMentions)
   if (message.reference?.messageId) {
     const relayed = relayMap.get(message.reference.messageId);
     if (relayed) {
@@ -536,8 +548,6 @@ client.on(Events.MessageCreate, async (message) => {
 });
 
 // ─── Propagation des réactions ────────────────────────────────────────────────
-
-// FIX : résolution du partial AVANT d'accéder à message.guildId
 const resolveReaction = async (reaction) => {
   if (reaction.partial) await reaction.fetch();
   if (reaction.message.partial) await reaction.message.fetch();
@@ -545,7 +555,6 @@ const resolveReaction = async (reaction) => {
 };
 
 const propagateReaction = async (message, emoji, action) => {
-  // FIX : sécuriser l'accès à guildId (peut être null sur un partial non résolu)
   if (!message.guildId) return;
 
   const channelId = connectedChannels.get(message.guildId);
