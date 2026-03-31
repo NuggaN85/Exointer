@@ -54,8 +54,8 @@ Le bot utilise des commandes slash pour interagir avec les utilisateurs. Voici l
 ## Utilisation
 
 1. Invitez le bot sur votre serveur Discord en utilisant le lien OAuth2 généré dans le [Portail Développeur Discord](https://discord.com/developers/applications).
-2. Utilisez la commande `/interserveur generer` pour créer une nouvelle fréquence.
-3. Utilisez la commande `/interserveur lier <frequence>` pour lier un canal à une fréquence existante.
+2. Utilisez la commande `/interserveur config` Configurer ce salon.
+3. Utilisez la commande `/interserveur deconfig` Déconnecter ce salon.
 4. Envoyez des messages dans le canal lié, et ils seront relayés à tous les autres canaux liés à la même fréquence.
 
 ## Contribution
