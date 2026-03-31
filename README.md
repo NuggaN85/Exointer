@@ -21,7 +21,6 @@ Ce bot Discord permet aux utilisateurs de créer des connexions inter-serveurs e
 
 - Node.js (version 16 ou supérieure)
 - Un bot Discord (créé via le [Portail Développeur Discord](https://discord.com/developers/applications))
-- Les permissions nécessaires pour ajouter le bot à vos serveurs
 
 ## Installation
 
@@ -35,6 +34,14 @@ CLIENT_ID=VOTRE_CLIENT_ID
 ```
 
 4. Exécutez le bot avec la commande `node index.js`.
+
+## Ajouter le bot
+
+- Les permissions nécessaires pour ajouter le bot à vos serveurs
+
+```plaintext
+https://discord.com/oauth2/authorize?client_id=ID_BOT&permissions=378494086224&scope=bot+applications.commands
+```
 
 ## Commandes
 
