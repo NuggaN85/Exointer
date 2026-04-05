@@ -31,11 +31,8 @@ const client = new Client({
     Partials.User,
     Partials.Reaction,
   ],
-  rest: {
-    timeout: 30000,
-    retries: 3,
-  },
-  shards: 'auto',
+  rest: { timeout: 30000, retries: 3, offset: 50 },
+  shards: 'auto', closeTimeout: 5000, restGlobalRateLimit: 50,
 });
 
 // ─── Base de données SQLite ───────────────────────────────────────────────────
